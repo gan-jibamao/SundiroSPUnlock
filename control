@@ -1,6 +1,6 @@
 Package: com.huayuarc.spsundiro
 Name: Sundiro BLE Unlock (SpringBoard)
-Version: 1.0.7
+Version: 1.0.8
 Architecture: iphoneos-arm64e
 Description: 新大洲本田蓝牙无感解锁 · SpringBoard 插件
  把「连车 + 发四帧解锁」从官方 App 里独立出来，直接跑在 SpringBoard 内。

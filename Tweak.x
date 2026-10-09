@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.0.7"
+#define SPVER        @"1.0.8"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -223,28 +223,71 @@ static BOOL SPFlag(NSString *k, BOOL def) {
 }
 
 // App 侧把学到的车写进它自己的域 "sb.vehicle"，同以 mobile 用户读得到
-// 车辆 UUID 的多个可能来源 —— 逐个试并留痕，方便定位到底写在哪
-static NSString *SPKnownVehicleUUID(void) {
+//════════════ 读取官方 App 学到的车辆 UUID ════════════
+// ★ 关键：App 用的是 [NSUserDefaults standardUserDefaults]（见 SundiroBLE.m:389/428），
+//   即存在 App 自己的容器里：
+//     /var/mobile/Containers/Data/Application/<App-UUID>/Library/Preferences/com.sundirohonda.app.plist
+//   从 SpringBoard **不能**用 initWithSuiteName: 直接读到（那是 app 域，不是 suite）。
+//   1.0.7 日志实测：三个 suite 全部读空，就是这个原因。
+//   下面两条路：① cfprefsd 跨用户域读 ② 直接扫文件系统（jbroot 下路径经 systemhook 重定向）
+
+static NSString *const kAppBundleID = @"com.sundirohonda.app";
+static NSString *const kAppGroupID2 = @"group.com.carbit.edrive.honda";
+
+static id SPReadPref(NSString *key) {
+    // ① cfprefsd：以 AnyUser/AnyHost 读 app 域
     @try {
-        struct { const char *suite; const char *key; } srcs[] = {
-            {"com.sundirohonda.app",            "sb.vehicle"},
-            {"com.huayuarc.spsundiro",          "vehicle"},
-            {"group.com.carbit.edrive.honda",   "sb.vehicle"},
-            {NULL, NULL}
-        };
-        for (int i = 0; srcs[i].suite; i++) {
-            NSString *suite = @(srcs[i].suite);
-            NSString *key   = @(srcs[i].key);
-            NSString *v = [[[NSUserDefaults alloc] initWithSuiteName:suite] stringForKey:key];
-            if (v.length) {
-                SPLog(@"probe", @"车辆UUID 来源命中: %@ / %@ = %@", suite, key, v);
-                return v;
+        CFPropertyListRef v = CFPreferencesCopyValue(
+            (__bridge CFStringRef)key,
+            (__bridge CFStringRef)kAppBundleID,
+            kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+        if (v) {
+            id r = (__bridge_transfer id)v;
+            if ([r isKindOfClass:NSString.class] && [r length]) {
+                SPLog(@"probe", @"cfprefsd 命中 %@ = %@", key, r);
+                return r;
             }
-            SPLog(@"probe", @"车辆UUID 来源空: %@ / %@", suite, key);
         }
-        SPLog(@"probe", @"★ 所有来源都没读到车辆 UUID");
-        return nil;
-    } @catch (NSException *e) { SPLog(@"probe", @"读 UUID 异常: %@", e.reason); return nil; }
+    } @catch (NSException *e) { }
+
+    // ② 直接扫文件系统（App 容器 + App Group）
+    @try {
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSArray *dirs = @[
+            @"/var/mobile/Containers/Data/Application",
+            @"/var/mobile/Containers/Shared/AppGroup",
+        ];
+        NSArray *plists = @[ @"com.sundirohonda.app", kAppGroupID2 ];
+        for (NSString *base in dirs) {
+            NSArray *subs = [fm contentsOfDirectoryAtPath:base error:nil];
+            for (NSString *sub in subs) {
+                for (NSString *pn in plists) {
+                    NSString *p = [NSString stringWithFormat:
+                        @"%@/%@/Library/Preferences/%@.plist", base, sub, pn];
+                    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+                    if (!d) continue;
+                    id v = d[key];
+                    if ([v isKindOfClass:NSString.class] && [v length]) {
+                        SPLog(@"probe", @"扫描命中 %@ ← %@", key, p);
+                        return v;
+                    }
+                }
+            }
+        }
+        SPLog(@"probe", @"★ App 容器里也没找到 %@（App 可能从未连过车）", key);
+    } @catch (NSException *e) { SPLog(@"probe", @"扫盘异常: %@", e.reason); }
+    return nil;
+}
+
+static NSString *SPKnownVehicleUUID(void) {
+    NSString *u = SPReadPref(@"sb.vehicle");
+    if (!u) u = SPReadPref(@"vehicle");
+    if (u) SPLog(@"probe", @"车辆 UUID = %@", u);
+    return u;
+}
+
+static NSString *SPKnownVehicleName(void) {
+    return SPReadPref(@"sb.vehicle.name");
 }
 
 //──────────────────────── 造帧（与 App 侧逐行一致）────────────────────────
@@ -346,6 +389,11 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
     if (!_cm || _cm.state != CBManagerStatePoweredOn) return;
     if (!_car) {
         // 先用 App 学到的 UUID retrieve（不解锁时也能少扫一轮）
+        // 名字也读出来 —— 万一 UUID 拿不到，还有名字可匹配
+        if (!_carName.length) {
+            NSString *nm = SPKnownVehicleName();
+            if (nm.length) { _carName = nm; SPLog(@"probe", @"已知车名 = %@", nm); }
+        }
         NSString *u = SPKnownVehicleUUID();
         if (u.length) {
             NSUUID *nid = [[NSUUID alloc] initWithUUIDString:u];
