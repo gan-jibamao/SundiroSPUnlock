@@ -1,0 +1,42 @@
+name: Build SundiroSPUnlock
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [roothide, rootless]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install theos (roothide fork) + SDK + ldid
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git $THEOS
+          rm -rf $THEOS/sdks
+          git clone --depth 1 https://github.com/theos/sdks.git $THEOS/sdks
+          brew install ldid
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+      - name: Build (${{ matrix.scheme }})
+        run: |
+          export THEOS=$HOME/theos
+          make clean >/dev/null 2>&1 || true
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }}
+          mkdir -p out
+          find packages -name '*.deb' -exec cp {} out/ \;
+          ls -l out/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: SundiroSPUnlock-${{ matrix.scheme }}
+          path: out/*.deb
+          if-no-files-found: error
