@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.0.5"
+#define SPVER        @"1.0.6"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -266,6 +266,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) NSInteger         unlocks;
 @property (nonatomic, assign) BOOL              scanning;
 @property (nonatomic, assign) BOOL              armed;
+@property (nonatomic, assign) NSTimeInterval    nextScanAt;   // 扫描冷却
 @end
 
 @implementation SPUnlocker
@@ -301,12 +302,18 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 //──────────────────────── 扫描 / 连接 ────────────────────────
 - (void)beginScan:(NSString *)why {
     if (!_cm || _cm.state != CBManagerStatePoweredOn || _scanning) return;
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    if (now < _nextScanAt) return;                 // 冷却期内不扫，省电
+    _nextScanAt = now + 60.0;                      // 一轮扫完歇 60 秒
+    // ★ 不限定服务 UUID：无法确认车在广播里一定带 FFF0
+    //   （App 版靠 retrieve 已知 UUID 连车，**从未真正跑过扫描**，所以这点未经验证）。
+    //   改为全扫，再用「已知 UUID」或「名字前缀 SDH-」双重匹配（见 didDiscoverPeripheral）。
     NSDictionary *o = @{ CBCentralManagerScanOptionAllowDuplicatesKey: @NO };
-    [_cm scanForPeripheralsWithServices:@[[CBUUID UUIDWithString:kSvcFFF0]] options:o];
+    [_cm scanForPeripheralsWithServices:nil options:o];
     _scanning = YES;
-    SPLog(@"link", @"开始扫描 FFF0（%@）", why);
-    // 扫描窗口 20 秒，到点停，避免后台无脑扫
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+    SPLog(@"link", @"开始扫描（全设备，%@）", why);
+    // 扫描窗口 25 秒，到点停
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [self stopScan:@"窗口结束"];
     });
@@ -436,7 +443,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
         _armed = YES;
         [self tryConnect];
     } else if (cm.state == CBManagerStateUnauthorized) {
-        SPLog(@"boot", @"★ SpringBoard 未获蓝牙授权 —— 本工作（这是路线 D 的生死项）");
+        SPLog(@"boot", @"★ SpringBoard 未获蓝牙授权 —— 无法使用 CoreBluetooth");
     }
 }
 
@@ -548,7 +555,16 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
 //════════════════════════════ 常驻驱动 ════════════════════════════
 //  P3 保活：每 15 秒核一次 —— 没连就连，连上但没解开就再发一轮。
 //  不做任何定时器密集刷（15 秒一次，代价可忽略）。
+// ★ 必须静态强持有：CBCentralManager 的 delegate 是 **weak** 引用。
+//   1.0.5 日志实测：用块内局部变量时，块一结束实例就被 ARC 回收
+//   → delegate 变 nil → centralManagerDidUpdateState 永远不回调
+//   （日志只到「SPUnlocker 启动」就断，连一行「蓝牙状态」都没有）
+static SPUnlocker *gUnlocker = nil;
+
 static void SPTick(SPUnlocker *u) {
+    // ★ 先续期、再干活：否则 armed 还是 NO 时提前 return，循环只跑一次就断
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ SPTick(u); });
     @try {
         if (!u.armed) return;
         if (!u.car || u.car.state != CBPeripheralStateConnected) {
@@ -557,8 +573,6 @@ static void SPTick(SPUnlocker *u) {
             [u directBegin];
         }
     } @catch (NSException *e) { /* 吞 */ }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ SPTick(u); });
 }
 
 //════════════════════════════ 入口（Theos/logos）════════════════════════════
@@ -572,9 +586,9 @@ static void SPTick(SPUnlocker *u) {
         if (!SPFlag(@"enable", YES)) { SPLog(@"boot", @"配置为停用，退出"); return; }
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             @try {
-                SPUnlocker *u = [SPUnlocker new];
-                [u start];
-                SPTick(u);
+                gUnlocker = [SPUnlocker new];   // ★ 静态强持有，防被 ARC 回收
+                [gUnlocker start];
+                SPTick(gUnlocker);
             } @catch (NSException *e) {
                 SPLog(@"boot", @"★ 启动异常 %@: %@\n%@", e.name, e.reason,
                       [e.callStackSymbols componentsJoinedByString:@"\n"]);
