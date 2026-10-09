@@ -27,18 +27,17 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.0.8"
-#define kKillSwitch  "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.off"
-#define kLogPathConf "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.logpath"
+#define SPVER        @"1.0.9"
+#define kKillSwitch  "/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
+#define kLogPathConf "/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
-#define kPrefsSuite  @"com.huayuarc.spsundiro"
+#define kPrefsSuite  @"com.jibamao.spsundiro"
 #define kAppPrefs    @"com.sundirohonda.app"
 #define kLogMax      (512 * 1024)
 
 // 服务/特征（实测常量，见 SundiroBLE.m 第 77–78 行）
 static NSString *const kSvcFFF0   = @"0000FFF0-0000-1000-8000-00805F9B34FB";
 static const char *kNamePrefix    = "SDH-";     // 车名实测以 SDH- 开头
-static NSString *const kRestoreID = @"com.huayuarc.spsundiro.central";
 
 // 解锁协议常量（原样抠自 SundiroBLE.m 94–198 行）
 // ── 解锁协议常量（原样抠自 SundiroBLE.m 第 94–198 行）──
@@ -155,7 +154,7 @@ static char gLogPath[512];
 // ★ 多路径候选：SpringBoard 沙盒 / RootHide 路径差异都兜住
 static const char *kLogCandidates[] = {
     "/var/mobile/Library/Logs/sundirosp.log",
-    "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.log",
+    "/var/mobile/Library/Preferences/com.jibamao.spsundiro.log",
     "/var/mobile/Documents/sundirosp.log",
     "/var/jb/var/mobile/Library/Logs/sundirosp.log",
     "/tmp/sundirosp.log",

@@ -62,8 +62,8 @@ cat /rootfs/var/mobile/Library/Logs/sundirosp.log
 
 | 动作 | 命令 |
 |:--|:--|
-| 立即停用 | `touch /var/mobile/Library/Preferences/com.huayuarc.spsundiro.off` 后 `killall -9 SpringBoard` |
-| 恢复 | `rm /var/mobile/Library/Preferences/com.huayuarc.spsundiro.off` |
+| 立即停用 | `touch /var/mobile/Library/Preferences/com.jibamao.spsundiro.off` 后 `killall -9 SpringBoard` |
+| 恢复 | `rm /var/mobile/Library/Preferences/com.jibamao.spsundiro.off` |
 | 卸载 | Sileo 卸载，或删 `DynamicLibraries/SundiroSPUnlock.{dylib,plist}` |
 
 ## 安全设计
