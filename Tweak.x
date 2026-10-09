@@ -37,7 +37,7 @@
 
 // 服务/特征（实测常量，见 SundiroBLE.m 第 77–78 行）
 static NSString *const kSvcFFF0   = @"0000FFF0-0000-1000-8000-00805F9B34FB";
-static const char *kNamePrefix    = "SDH-";     // 车名实测 SDH-49D6FD
+static const char *kNamePrefix    = "SDH-";     // 车名实测以 SDH- 开头
 static NSString *const kRestoreID = @"com.huayuarc.spsundiro.central";
 
 // 解锁协议常量（原样抠自 SundiroBLE.m 94–198 行）
@@ -237,7 +237,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
     [d appendBytes:h length:7];
     if (pay && payLen) [d appendBytes:pay length:payLen];
     unsigned char x = 0;
-    const unsigned char *b = d.bytes;
+    const unsigned char *b = (const unsigned char *)d.bytes;
     for (NSUInteger i = 0; i < d.length; i++) x ^= b[i];
     [d appendBytes:&x length:1];
     unsigned char t[2] = {0xAA, 0xAA};
