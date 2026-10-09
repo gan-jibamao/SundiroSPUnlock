@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.0.6"
+#define SPVER        @"1.0.7"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -223,12 +223,28 @@ static BOOL SPFlag(NSString *k, BOOL def) {
 }
 
 // App 侧把学到的车写进它自己的域 "sb.vehicle"，同以 mobile 用户读得到
+// 车辆 UUID 的多个可能来源 —— 逐个试并留痕，方便定位到底写在哪
 static NSString *SPKnownVehicleUUID(void) {
     @try {
-        NSString *u = [[[NSUserDefaults alloc] initWithSuiteName:kAppPrefs] stringForKey:@"sb.vehicle"];
-        if (u.length) return u;
-        return [[[NSUserDefaults alloc] initWithSuiteName:kPrefsSuite] stringForKey:@"vehicle"];
-    } @catch (NSException *e) { return nil; }
+        struct { const char *suite; const char *key; } srcs[] = {
+            {"com.sundirohonda.app",            "sb.vehicle"},
+            {"com.huayuarc.spsundiro",          "vehicle"},
+            {"group.com.carbit.edrive.honda",   "sb.vehicle"},
+            {NULL, NULL}
+        };
+        for (int i = 0; srcs[i].suite; i++) {
+            NSString *suite = @(srcs[i].suite);
+            NSString *key   = @(srcs[i].key);
+            NSString *v = [[[NSUserDefaults alloc] initWithSuiteName:suite] stringForKey:key];
+            if (v.length) {
+                SPLog(@"probe", @"车辆UUID 来源命中: %@ / %@ = %@", suite, key, v);
+                return v;
+            }
+            SPLog(@"probe", @"车辆UUID 来源空: %@ / %@", suite, key);
+        }
+        SPLog(@"probe", @"★ 所有来源都没读到车辆 UUID");
+        return nil;
+    } @catch (NSException *e) { SPLog(@"probe", @"读 UUID 异常: %@", e.reason); return nil; }
 }
 
 //──────────────────────── 造帧（与 App 侧逐行一致）────────────────────────
@@ -304,7 +320,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
     if (!_cm || _cm.state != CBManagerStatePoweredOn || _scanning) return;
     NSTimeInterval now = NSDate.date.timeIntervalSince1970;
     if (now < _nextScanAt) return;                 // 冷却期内不扫，省电
-    _nextScanAt = now + 60.0;                      // 一轮扫完歇 60 秒
+    _nextScanAt = now + 20.0;                      // 一轮扫完歇 20 秒（实测期调快）
     // ★ 不限定服务 UUID：无法确认车在广播里一定带 FFF0
     //   （App 版靠 retrieve 已知 UUID 连车，**从未真正跑过扫描**，所以这点未经验证）。
     //   改为全扫，再用「已知 UUID」或「名字前缀 SDH-」双重匹配（见 didDiscoverPeripheral）。
@@ -335,11 +351,14 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
             NSUUID *nid = [[NSUUID alloc] initWithUUIDString:u];
             if (nid) {
                 NSArray *found = [_cm retrievePeripheralsWithIdentifiers:@[nid]];
+                SPLog(@"probe", @"retrieve 已知 UUID 命中 %lu 个外设", (unsigned long)found.count);
                 if (found.count) {
                     [self adopt:found.firstObject why:@"retrieve"];
                 } else {
-                    _carUUID = u;
+                    _carUUID = u;      // 记住 UUID，等扫描按 UUID 命中
                 }
+            } else {
+                SPLog(@"probe", @"★ UUID 字符串非法: %@", u);
             }
         }
     }
