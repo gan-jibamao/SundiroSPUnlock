@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.0.9"
+#define SPVER        @"1.1.0"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -325,6 +325,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) BOOL              scanning;
 @property (nonatomic, assign) BOOL              armed;
 @property (nonatomic, assign) NSTimeInterval    nextScanAt;   // 扫描冷却
+@property (nonatomic, assign) long              ticks;        // 心跳计数
 @end
 
 @implementation SPUnlocker
@@ -609,6 +610,13 @@ didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
 }
 
 - (void)peripheral:(CBPeripheral *)p
+didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
+    // ★ 订阅确认回调：FFF1 订阅成功与否，直接决定车的回帧能不能到我们这里
+    if (e) SPLog(@"gatt", @"⚠️ FFF1 订阅失败：%@", e.localizedDescription);
+    else   SPLog(@"gatt", @"FFF1 订阅%@（isNotifying=%d）", ch.isNotifying ? @"已生效" : @"被关闭", ch.isNotifying);
+}
+
+- (void)peripheral:(CBPeripheral *)p
 didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
     if (!ch.value || ch.value.length == 0) return;
     _lastCarFrame = NSDate.date.timeIntervalSince1970;
@@ -632,6 +640,14 @@ static void SPTick(SPUnlocker *u) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ SPTick(u); });
     @try {
+        u.ticks++;
+        // ★ 心跳：每 8 跳（约 2 分钟）报一次现场，证明插件还活着、外设处于什么状态。
+        //   没有它的话，pending connect 若被系统悄悄撤掉，日志上看不出来。
+        if (u.armed && (u.ticks % 8) == 0) {
+            SPLog(@"life", @"心跳 #%ld 外设状态=%ld 已连=%ld 已解锁=%ld 步=%ld 写特征=%@",
+                  (long)u.ticks, (long)u.car.state, (long)u.connects,
+                  (long)u.unlocks, (long)u.step, u.wr ? @"有" : @"无");
+        }
         if (!u.armed) return;
         if (!u.car || u.car.state != CBPeripheralStateConnected) {
             [u tryConnect];
