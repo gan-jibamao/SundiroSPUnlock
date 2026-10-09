@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.0.4"
+#define SPVER        @"1.0.5"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -283,10 +283,15 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
         SPLog(@"boot", @"宿主 %@ 非 SpringBoard —— 只留信标，不起蓝牙引擎", bid);
         return;
     }
-    NSDictionary *opt = @{
-        CBCentralManagerOptionRestoreIdentifierKey: kRestoreID,
-        CBCentralManagerOptionShowPowerAlertKey:    @NO
-    };
+    // ★★★ 绝不能带 CBCentralManagerOptionRestoreIdentifierKey！
+    //   实测（1.0.4 日志）在 SpringBoard 里会抛：
+    //     NSInternalInconsistencyException: State restoration of CBCentralManager
+    //     is only allowed for applications that have specified the
+    //     "bluetooth-central" background mode
+    //   iOS 只在 Info.plist 声明了 bluetooth-central 后台模式的 App 里允许状态恢复；
+    //   SpringBoard 是系统常驻进程，既没这个 key、也**根本不需要**状态恢复
+    //   （进程永不退出，无需被系统重新拉起）。这是从 App 版移植过来的历史包袱。
+    NSDictionary *opt = @{ CBCentralManagerOptionShowPowerAlertKey: @NO };
     _cm = [[CBCentralManager alloc] initWithDelegate:self
                                                queue:dispatch_get_global_queue(QOS_CLASS_UTILITY, 0)
                                              options:opt];
@@ -435,6 +440,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
     }
 }
 
+// 注：SpringBoard 版不再使用状态恢复，这个回调正常情况下不会被调用，保留仅为兼容。
 - (void)centralManager:(CBCentralManager *)cm
  willRestoreState:(NSDictionary<NSString *, id> *)dict {
     NSArray<CBPeripheral *> *ps = dict[CBCentralManagerRestoredStatePeripheralsKey];
