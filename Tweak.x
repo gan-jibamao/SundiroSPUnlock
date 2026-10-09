@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.0.3"
+#define SPVER        @"1.0.4"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.huayuarc.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -186,27 +186,29 @@ static void SPLog(NSString *tag, NSString *fmt, ...) {
             char bak[600]; snprintf(bak, sizeof bak, "%s.1", gLogPath);
             rename(gLogPath, bak);
         }
-        char body[2048];
+        // ★★★ 必须用 Objective-C 格式化：C 的 vsnprintf 不认识 %@（那属于 ObjC），
+        //   会把 %@ 退化成 @，并让后续参数整体错位 ——
+        //   实测导致 pid/uid 变乱码、异常内容整条丢失（日志只剩 "启动异常: @"）。
         va_list ap; va_start(ap, fmt);
-        vsnprintf(body, sizeof body, fmt.UTF8String ? fmt.UTF8String : "?", ap);
+        NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
         va_end(ap);
+        if (!body) return;
 
         time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
         char ts[32]; strftime(ts, sizeof ts, "%m-%d %H:%M:%S", &tm);
-
-        char line[2300];
-        int n = snprintf(line, sizeof line, "%s [%s] %s", ts, tag.UTF8String, body);
-        if (n <= 0) return;
+        NSString *line = [NSString stringWithFormat:@"%s [%@] %@", ts, tag, body];
 
         // ① NSLog 一定写系统日志（Console 可读），沙盒拦不住
-        NSLog(@"[SundiroSPUnlock] %s", line);
+        NSLog(@"[SundiroSPUnlock] %@", line);
 
         // ② 文件日志：按候选顺序把每一行同时写进所有能打开的文件
+        NSData *db = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *nl = [@"\n" dataUsingEncoding:NSUTF8StringEncoding];
         for (int i = 0; kLogCandidates[i]; i++) {
             FILE *f = fopen(kLogCandidates[i], "a");
             if (!f) continue;
-            fwrite(line, 1, (size_t)n, f);
-            fputc('\n', f);
+            fwrite(db.bytes, 1, db.length, f);
+            fwrite(nl.bytes, 1, nl.length, f);
             fflush(f); fclose(f);
             if (!gLogPath[0]) snprintf(gLogPath, sizeof gLogPath, "%s", kLogCandidates[i]);
         }
@@ -567,7 +569,10 @@ static void SPTick(SPUnlocker *u) {
                 SPUnlocker *u = [SPUnlocker new];
                 [u start];
                 SPTick(u);
-            } @catch (NSException *e) { SPLog(@"boot", @"启动异常: %@", e.reason); }
+            } @catch (NSException *e) {
+                SPLog(@"boot", @"★ 启动异常 %@: %@\n%@", e.name, e.reason,
+                      [e.callStackSymbols componentsJoinedByString:@"\n"]);
+            }
         });
     } @catch (NSException *e) { /* 绝不外泄到 SpringBoard */ }
 }
