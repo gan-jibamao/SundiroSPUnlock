@@ -3,7 +3,7 @@
 把「新大洲本田」蓝牙**无感解锁**独立成 **SpringBoard 插件**，不再依赖官方 App。
 车况遥测 / 小组件 / 深链控制仍由官方 App 侧组件负责，两者互不干扰。
 
-**当前版本：1.1.4** ｜ 支持 `iphoneos-arm64e`（RootHide）与 `iphoneos-arm64`（rootless）
+**当前版本：1.2.0** ｜ 支持 `iphoneos-arm64e`（RootHide）与 `iphoneos-arm64`（rootless）
 
 ---
 
@@ -161,9 +161,24 @@ Filter = { Bundles = [com.apple.springboard], Executables = [SpringBoard] }
 ## 已知限制
 
 - **与官方 App 会抢链路** —— 建议用前把官方 App 从后台划掉。
+  1.2.0 起同秒双发连接请求已消除，但**两个 central 争同一辆车**这一点本质未变。
 - 日志中偶见 `Failed to encrypt the connection` —— 在官方 App 版日志里也出现过，归因**蓝牙弱信号**；
   另一常见诱因是**同时有另一个 central 连着车**。二者无法从日志区分。
 - 「车 UUID 未知」时（App 从未连过车）会进入扫描模式，认车最多多等 60 秒。
+- **车回帧仅按长度匹配**（26 / 42）—— 这是继承自已量产官方 App 的宽松匹配，
+  收紧只会降低解锁成功率，故保持原样。详见 CHANGELOG「明确不改」。
+
+## 安全阀（kill-switch）
+
+创建以下文件后注销桌面（respring）即停用，删除后重新注销即恢复：
+
+```
+/var/mobile/Library/Preferences/com.jibamao.spsundiro.off
+```
+
+1.2.0 起会同时探测**真实根 / `/var/jb`（rootless）/ 全部 `.jbroot-*`（RootHide）**，
+所以无论你用哪种工具创建，都能被认到；命中时日志会留一行
+`★ kill-switch 命中（<路径>）—— 不启动蓝牙`，可直接验证。
 
 ---
 

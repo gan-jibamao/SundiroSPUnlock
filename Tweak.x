@@ -8,8 +8,8 @@
 //  已实测可用；本文件不重新逆向，原样移植。
 //
 //  ★ 安全设计（SpringBoard 崩 = 注销，开机崩 = 白苹果循环，故逐条设防）：
-//     1. kill-switch 文件存在 → 构造器第一行就 return，绝不碰蓝牙
-//     2. 全部逻辑在后台串行队列，绝不在 SpringBoard 启动路径上做重活
+//     1. kill-switch 文件存在 → 起蓝牙引擎前就 return，绝不碰蓝牙（含 RootHide 隐根）
+//     2. 全部逻辑在**专用串行队列**（SPQueue）上，绝不在 SpringBoard 启动路径上做重活
 //     3. 逐层 @try/@catch，异常绝不外泄
 //     4. 失败自动重试但永不 busy-loop（退避 + 冷却）
 //
@@ -27,16 +27,14 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.1.6"
-#define kKillSwitch  "/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
-#define kLogPathConf "/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
+#define SPVER        @"1.2.0"
+#define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
+#define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
 #define kPrefsSuite  @"com.jibamao.spsundiro"
-#define kAppPrefs    @"com.sundirohonda.app"
 #define kLogMax      (512 * 1024)
 
-// 服务/特征（实测常量，见 SundiroBLE.m 第 77–78 行）
-static NSString *const kSvcFFF0   = @"0000FFF0-0000-1000-8000-00805F9B34FB";
+// 车名前缀（实测常量，见 SundiroBLE.m 第 77–78 行）
 static const char *kNamePrefix    = "SDH-";     // 车名实测以 "SDH-" 开头
 
 // 解锁协议常量（原样抠自 SundiroBLE.m 94–198 行）
@@ -148,33 +146,104 @@ static const struct { unsigned char r[16]; unsigned char r3[16]; } kUnlockPairs[
 static const NSUInteger kUnlockPairCount = 49;
 
 
+//────────────── 通用工具：专用串行队列 / 单调时钟 / 多根路径探测 ──────────────
+// ★ B1：必须是**串行**队列。头部注释一直声明"串行"，但 1.1.6 实际用的是
+//   dispatch_get_global_queue（并发）—— _step/_pick/_wr/_nt/_linkAt 等共享状态
+//   被 CBCentralManager 回调、retryLater、SPTick、directBegin 的定时块并发读写。
+//   最危险的组合：两个 directBegin 并发 → _pick 前进两次 → onCarFrame 第 2 步取到的
+//   R3 与第 1 步的 R 不是同一组 → 解锁直接失败。
+static dispatch_queue_t SPQueue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.jibamao.spsundiro.btq", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+// ★ C3：单调时钟。墙钟（NSDate.timeIntervalSince1970）被 NTP 校正或用户手动回拨时，
+//   now - _lastAt 会变成负数 → 20 秒冷却 / 60 秒扫描冷却 被锁死到时钟追平为止。
+static NSTimeInterval SPNow(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (NSTimeInterval)ts.tv_sec + (NSTimeInterval)ts.tv_nsec / 1e9;
+}
+
+// ★ C1：RootHide 的隐根是 **动态 UUID** 目录（每次重新越狱都会变），绝不能硬编码。
+//   插件 dylib 没有 vroot，读的是真实 /var/mobile/...；而终端类工具（带 vroot）创建的
+//   文件会落进 .../AppGroup/.jbroot-<UUID>/var/mobile/... 镜像 —— 两侧不一致会让
+//   安全阀静默失效。此处把所有可能的根都列出来逐一探测。
+static NSArray<NSString *> *SPRoots(void) {
+    NSMutableArray *a = [NSMutableArray arrayWithObjects:@"", @"/var/jb", nil];
+    @try {
+        NSString *base = @"/var/mobile/Containers/Shared/AppGroup";
+        for (NSString *d in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:base error:nil]) {
+            if ([d hasPrefix:@".jbroot-"])
+                [a addObject:[base stringByAppendingPathComponent:d]];
+        }
+    } @catch (NSException *e) { /* 探测失败不影响真实根 */ }
+    return a;
+}
+
+// 返回第一个真实存在的路径（real 形如 /var/mobile/Library/Preferences/xxx）
+static NSString *SPFind(NSString *real) {
+    for (NSString *r in SPRoots()) {
+        NSString *p = r.length ? [r stringByAppendingString:real] : real;
+        if (access(p.fileSystemRepresentation, F_OK) == 0) return p;
+    }
+    return nil;
+}
+
+// 日志候选路径 = 多根 × 相对路径（顺序保持 1.1.6 原有优先级）
+static NSArray<NSString *> *SPLogProbePaths(void) {
+    NSArray *rel = @[
+        @"/var/mobile/Library/Logs/sundirosp.log",
+        @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.log",
+        @"/var/mobile/Documents/sundirosp.log",
+        @"/tmp/sundirosp.log",
+        @"/var/tmp/sundirosp.log",
+    ];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *r in SPRoots())
+        for (NSString *x in rel)
+            [out addObject:(r.length ? [r stringByAppendingString:x] : x)];
+    return out;
+}
+
+
 //──────────────────────────── 日志 ────────────────────────────
 static char gLogPath[512];
 
-// ★ 多路径候选：SpringBoard 沙盒 / RootHide 路径差异都兜住
-static const char *kLogCandidates[] = {
-    "/var/mobile/Library/Logs/sundirosp.log",
-    "/var/mobile/Library/Preferences/com.jibamao.spsundiro.log",
-    "/var/mobile/Documents/sundirosp.log",
-    "/var/jb/var/mobile/Library/Logs/sundirosp.log",
-    "/tmp/sundirosp.log",
-    "/var/tmp/sundirosp.log",
-    NULL
-};
-
+// ★ D1：1.1.6 会把**每一行**同时写进 6 个候选文件，而轮转只覆盖其中一个 ——
+//   其余 5 个无界增长；且每行 6 次 fopen/fwrite/fflush/fclose 是串在解锁关键路径上的
+//   I/O（车回帧 → 打日志 → 写下一帧）。现改为：探测出**第一个真可写**的路径锁定，
+//   只写它；写失败时重新探测一次（保留原容错能力）。
 static void SPLogInit(void) {
     if (gLogPath[0]) return;
-    snprintf(gLogPath, sizeof gLogPath, "%s", kLogDefault);
-    FILE *f = fopen(kLogPathConf, "r");
-    if (f) {
-        char tmp[512] = {0};
-        if (fgets(tmp, sizeof tmp, f)) {
-            size_t n = strlen(tmp);
-            while (n && (tmp[n-1]=='\n'||tmp[n-1]=='\r')) tmp[--n]=0;
-            if (n) snprintf(gLogPath, sizeof gLogPath, "%s", tmp);
+    // ① 允许配置文件覆盖（同样做多根探测）
+    NSString *conf = SPFind(kLogPathConf);
+    if (conf) {
+        FILE *f = fopen(conf.fileSystemRepresentation, "r");
+        if (f) {
+            char tmp[512] = {0};
+            if (fgets(tmp, sizeof tmp, f)) {
+                size_t n = strlen(tmp);
+                while (n && (tmp[n-1]=='\n'||tmp[n-1]=='\r')) tmp[--n]=0;
+                if (n) snprintf(gLogPath, sizeof gLogPath, "%s", tmp);
+            }
+            fclose(f);
         }
-        fclose(f);
     }
+    // ② 未指定 → 探测第一个可写候选
+    if (!gLogPath[0]) {
+        for (NSString *p in SPLogProbePaths()) {
+            FILE *f = fopen(p.fileSystemRepresentation, "a");
+            if (!f) continue;
+            fclose(f);
+            snprintf(gLogPath, sizeof gLogPath, "%s", p.fileSystemRepresentation);
+            break;
+        }
+    }
+    if (!gLogPath[0]) snprintf(gLogPath, sizeof gLogPath, "%s", kLogDefault);
 }
 
 static void SPLog(NSString *tag, NSString *fmt, ...) {
@@ -200,16 +269,18 @@ static void SPLog(NSString *tag, NSString *fmt, ...) {
         // ① NSLog 一定写系统日志（Console 可读），沙盒拦不住
         NSLog(@"[SundiroSPUnlock] %@", line);
 
-        // ② 文件日志：按候选顺序把每一行同时写进所有能打开的文件
+        // ② 文件日志：只写已锁定的单一路径（★ D1）
         NSData *db = [line dataUsingEncoding:NSUTF8StringEncoding];
         NSData *nl = [@"\n" dataUsingEncoding:NSUTF8StringEncoding];
-        for (int i = 0; kLogCandidates[i]; i++) {
-            FILE *f = fopen(kLogCandidates[i], "a");
-            if (!f) continue;
+        FILE *f = fopen(gLogPath, "a");
+        if (!f) {                                   // 路径失效 → 重新探测一次
+            gLogPath[0] = 0; SPLogInit();
+            f = fopen(gLogPath, "a");
+        }
+        if (f) {
             fwrite(db.bytes, 1, db.length, f);
             fwrite(nl.bytes, 1, nl.length, f);
             fflush(f); fclose(f);
-            if (!gLogPath[0]) snprintf(gLogPath, sizeof gLogPath, "%s", kLogCandidates[i]);
         }
     } @catch (NSException *e) { /* 日志绝不抛 */ }
 }
@@ -317,7 +388,6 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) NSUInteger        pick;    // 配对表游标
 @property (nonatomic, assign) NSTimeInterval    lastAt;  // 冷却起点
 @property (nonatomic, assign) NSTimeInterval    startAt;
-@property (nonatomic, assign) NSTimeInterval    lastCarFrame;
 @property (nonatomic, assign) NSTimeInterval    doneLink;
 @property (nonatomic, assign) NSTimeInterval    linkAt;   // 本链路握手时刻（CBPeripheral 没这属性，自己记）
 @property (nonatomic, assign) NSInteger         connects;
@@ -327,7 +397,12 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) NSTimeInterval    nextScanAt;   // 扫描冷却
 @property (nonatomic, assign) long              ticks;        // 心跳计数
 @property (nonatomic, assign) NSTimeInterval    backoff;      // 重连退避（成功即复位）
+@property (nonatomic, assign) BOOL              connecting;   // ★ B2：连接请求已下发（原子守卫）
+@property (nonatomic, assign) NSUInteger        round;        // ★ A1：解锁轮次号（看门狗代际校验）
+@property (nonatomic, assign) NSInteger         stallRetries; // ★ A1：本链路自愈重发次数
 @end
+
+static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动，需前向声明
 
 @implementation SPUnlocker
 
@@ -355,15 +430,16 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
     _backoff = 1.0;      // ★ 退避初值。绝不依赖 ivar 默认 0 —— 否则 MIN(0,30)=0 秒，会疯狂重连
     NSDictionary *opt = @{ CBCentralManagerOptionShowPowerAlertKey: @NO };
     _cm = [[CBCentralManager alloc] initWithDelegate:self
-                                               queue:dispatch_get_global_queue(QOS_CLASS_UTILITY, 0)
+                                               queue:SPQueue()          // ★ B1：专用串行队列
                                              options:opt];
     SPLog(@"boot", @"SPUnlocker v%@ 启动 pid=%d uid=%d", SPVER, getpid(), getuid());
+    SPTick(self);        // ★ D2：只有真起了蓝牙引擎才启动常驻驱动（非 SB 宿主不再空转定时器）
 }
 
 //──────────────────────── 扫描 / 连接 ────────────────────────
 - (void)beginScan:(NSString *)why {
     if (!_cm || _cm.state != CBManagerStatePoweredOn || _scanning) return;
-    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    NSTimeInterval now = SPNow();                  // ★ C3：单调时钟
     if (now < _nextScanAt) return;                 // 冷却期内不扫，省电
     _nextScanAt = now + 60.0;                      // 一轮扫完歇 60 秒（1.0.7 曾为加速实测改成 20，P1 恢复）
     // ★ 不限定服务 UUID：无法确认车在广播里一定带 FFF0
@@ -375,7 +451,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
     SPLog(@"link", @"开始扫描（全设备，%@）", why);
     // 扫描窗口 25 秒，到点停
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                   SPQueue(), ^{                                   // ★ B1
         [self stopScan:@"窗口结束"];
     });
 }
@@ -396,24 +472,30 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
             NSString *nm = SPKnownVehicleName();
             if (nm.length) { _carName = nm; SPLog(@"probe", @"已知车名 = %@", nm); }
         }
-        NSString *u = SPKnownVehicleUUID();
-        if (u.length) {
-            NSUUID *nid = [[NSUUID alloc] initWithUUIDString:u];
+        // ★ C2：只读一次。1.1.6 缺这个前置判断 —— _car 停在 nil 时，SPTick 每 15 秒
+        //   就会重跑一次 SPKnownVehicleUUID()（遍历 App 容器 + AppGroup 全目录，约 200 次文件读）。
+        if (!_carUUID.length) {
+            NSString *u = SPKnownVehicleUUID();
+            if (u.length) _carUUID = u;
+        }
+        if (_carUUID.length) {
+            NSUUID *nid = [[NSUUID alloc] initWithUUIDString:_carUUID];
             if (nid) {
                 NSArray *found = [_cm retrievePeripheralsWithIdentifiers:@[nid]];
                 SPLog(@"probe", @"retrieve 已知 UUID 命中 %lu 个外设", (unsigned long)found.count);
-                if (found.count) {
-                    [self adopt:found.firstObject why:@"retrieve"];
-                } else {
-                    _carUUID = u;      // 记住 UUID，等扫描按 UUID 命中
-                }
+                if (found.count) [self adopt:found.firstObject why:@"retrieve"];
             } else {
-                SPLog(@"probe", @"★ UUID 字符串非法: %@", u);
+                SPLog(@"probe", @"★ UUID 字符串非法: %@", _carUUID);
             }
         }
     }
     if (!_car) { [self beginScan:@"还没有车对象"]; return; }
+    // ★ B2：_car.state 要等 CoreBluetooth 异步处理后才变 Connecting，而三个调用者
+    //   （状态回调 / retryLater / SPTick）可能同时通过状态守卫 → 同秒双发 connect。
+    //   1.1.6 日志铁证：16:52:40 两条「连接请求」，紧接着 16:52:44 Failed to encrypt。
+    if (_connecting) return;
     if (_car.state == CBPeripheralStateConnected || _car.state == CBPeripheralStateConnecting) return;
+    _connecting = YES;
     SPLog(@"link", @"连接请求 -> %@", _carName ?: _carUUID ?: @"(未知)");
     [_cm connectPeripheral:_car options:nil];
 }
@@ -429,12 +511,34 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 }
 
 //──────────────────────── 直发四帧（原样移植）────────────────────────
+// ★ A1：每步看门狗。1.1.6 只给第 1 帧设了 3 秒超时，而实测最慢 f1→f2 正好 3.0 秒 ——
+//   零余量；更要命的是 onCarFrame 推进到 2/3/4 之后**没有任何超时**，而三条恢复路径
+//   全被堵死（directBegin 的 _step!=0 早退 / SPTick 的 step==0 分支 / 唯一复位点只在断线），
+//   → 握手中途卡死就**永久停摆**，只能等车自己把链路断掉。
+- (void)armWatchdog:(NSInteger)expect {
+    NSUInteger gen = _round;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+                   SPQueue(), ^{
+        if (self->_round != gen)   return;   // 已进入新一轮 → 旧定时器作废
+        if (self->_step != expect) return;   // 已推进       → 无需处理
+        SPLog(@"direct", @"★ 第 %ld 帧后 8 秒无车回帧 —— 释放本轮", (long)expect);
+        self->_step = 0;
+        self->_lastAt = 0;                   // ★ 清冷却：失败不该吃掉 20 秒窗口
+        if (self->_stallRetries < 2 &&
+            self->_car.state == CBPeripheralStateConnected && self->_wr) {
+            self->_stallRetries++;
+            SPLog(@"direct", @"★ 链路仍在 —— 立即重发（自愈第 %ld 次）", (long)self->_stallRetries);
+            [self directBegin];
+        }
+    });
+}
+
 - (void)directBegin {
     @try {
         if (!SPFlag(@"unlock", YES)) return;
         if (_step != 0) return;
         if (!_wr || _car.state != CBPeripheralStateConnected) return;
-        NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+        NSTimeInterval now = SPNow();                  // ★ C3：单调时钟
         // 同一条链路已完整发过一轮 → 不再重复（车早就解开了）
         if (_doneLink > 0 && _linkAt > 0 && fabs(_doneLink - _linkAt) < 0.001) return;
         // 冷却 20 秒：断/连抖动时不刷帧
@@ -442,6 +546,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 
         _lastAt = now;
         _startAt = now;
+        _round++;                                      // ★ A1：新一轮 → 作废上一轮的看门狗
         const unsigned char *R = kUnlockPairs[_pick % kUnlockPairCount].r;
         _pick++;
         unsigned char pay[48];
@@ -453,13 +558,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
                    type:CBCharacteristicWriteWithResponse];
         SPLog(@"direct", @"-> 解锁帧 1/4（配对 #%lu）", (unsigned long)((_pick - 1) % kUnlockPairCount));
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            if (self->_step == 1) {
-                SPLog(@"direct", @"第 1 帧后 3 秒无车回帧，放弃本轮");
-                self->_step = 0;
-            }
-        });
+        [self armWatchdog:1];                          // ★ A1（原 3 秒一次性超时 → 统一的每步看门狗）
     } @catch (NSException *e) { SPLog(@"direct", @"directBegin 异常: %@", e.reason); _step = 0; }
 }
 
@@ -472,6 +571,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
             [_car writeValue:SPFrame(0x00, 0x01, 0x00, 0xFA, NULL, 0)
           forCharacteristic:_wr type:CBCharacteristicWriteWithResponse];
             SPLog(@"direct", @"-> 解锁帧 2/4");
+            [self armWatchdog:2];                      // ★ A1
             return;
         }
         if (_step == 2 && (L == 42 || L == 26)) {
@@ -481,6 +581,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
             [_car writeValue:SPFrame(0x02, 0x02, 0x03, 0xFA, R3, 16)
           forCharacteristic:_wr type:CBCharacteristicWriteWithResponse];
             SPLog(@"direct", @"-> 解锁帧 3/4");
+            [self armWatchdog:3];                      // ★ A1
             return;
         }
         if (_step == 3 && L == 26) {
@@ -488,13 +589,15 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
             [_car writeValue:SPFrame(0x00, 0x03, 0x04, 0xFA, NULL, 0)
           forCharacteristic:_wr type:CBCharacteristicWriteWithResponse];
             SPLog(@"direct", @"-> 解锁帧 4/4");
+            [self armWatchdog:4];                      // ★ A1
             _unlocks++;
             // ★ A1 修复：本链路已解锁，打上记号 —— 否则直发守卫第 437 行恒为假，
             //   车早已解开却每 ~30 秒（SPTick 15s × 20s 冷却）重发一轮四帧。
             //   断开时 didDisconnectPeripheral 会把它清 0，下次靠近照样解锁。
             _doneLink = _linkAt;
+            _stallRetries = 0;                         // ★ A1：本轮链路自愈计数归零
             SPLog(@"direct", @"★ 四帧发完 —— 耗时 %.0f ms（累计成功 %ld 次）",
-                  (NSDate.date.timeIntervalSince1970 - _startAt) * 1000.0, (long)_unlocks);
+                  (SPNow() - _startAt) * 1000.0, (long)_unlocks);   // ★ C3
             _step = 0;
         }
     } @catch (NSException *e) { SPLog(@"direct", @"onCarFrame 异常: %@", e.reason); _step = 0; }
@@ -549,7 +652,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
         }
         // ③ 其余只在日志留痕（低频，别刷屏）
         static NSTimeInterval lastLog = 0;
-        NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+        NSTimeInterval now = SPNow();                  // ★ C3：单调时钟
         if (nm.length && now - lastLog > 20.0) {
             lastLog = now;
             SPLog(@"link", @"旁侧设备 %@ RSSI=%@", nm, RSSI);
@@ -559,6 +662,8 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 
 - (void)centralManager:(CBCentralManager *)cm didConnectPeripheral:(CBPeripheral *)p {
     _connects++;
+    _connecting = NO;    // ★ B2：连接已落地，守卫复位
+    _stallRetries = 0;   // ★ A1：新链路，自愈计数归零
     _backoff = 1.0;      // ★ A3：连上了 → 退避归位 1 秒。
                          //   原来 backoff 是 static 局部变量，只增不减、永不复位，
                          //   封顶 30 秒后即便连成功几十次也永远 30 秒才重连。
@@ -572,6 +677,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 
 - (void)centralManager:(CBCentralManager *)cm
 didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
+    _connecting = NO;                                  // ★ B2
     SPLog(@"link", @"连接失败：%@", e.localizedDescription);
     [self retryLater:@"连接失败"];
 }
@@ -579,6 +685,7 @@ didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 - (void)centralManager:(CBCentralManager *)cm
 didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
     _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0;
+    _connecting = NO; _stallRetries = 0; _round++;      // ★ B2/A1：链路已断，守卫与看门狗全作废
     SPLog(@"link", @"⚠️ 断开：%@", e ? e.localizedDescription : @"主动/正常断开");
     [self retryLater:@"断开"];
 }
@@ -590,7 +697,7 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
     _backoff = MIN(_backoff * 2.0, 30.0);
     SPLog(@"link", @"%@ → %.0f 秒后重试", why, d);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                   SPQueue(), ^{                                   // ★ B1
         [self tryConnect];
     });
 }
@@ -616,7 +723,7 @@ didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
         SPLog(@"gatt", @"订阅 FFF1（车的回帧从这条来）");
     }
     if (_wr) {
-        _linkAt = NSDate.date.timeIntervalSince1970;   // 记号：本链路
+        _linkAt = SPNow();                             // ★ C3：记号：本链路
         SPLog(@"gatt", @"写特征 FFF6 就绪 → 立刻直发");
         [self directBegin];
     }
@@ -632,9 +739,19 @@ didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)ch error:(NSErro
 - (void)peripheral:(CBPeripheral *)p
 didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
     if (!ch.value || ch.value.length == 0) return;
-    _lastCarFrame = NSDate.date.timeIntervalSince1970;
     SPLog(@"car", @"← 车回帧 %@ len=%lu", ch.UUID.UUIDString, (unsigned long)ch.value.length);
     [self onCarFrame:ch.value];
+}
+
+// ★ A2：1.1.6 完全没有实现这个回调。四帧全部用 CBCharacteristicWriteWithResponse 写出，
+//   带响应写本该有回执 —— 缺了它，写失败时 _step 既不推进也不回退，直接掉进 A1 要修的
+//   停摆，而且要白等一次 8 秒看门狗。
+- (void)peripheral:(CBPeripheral *)p
+didWriteValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
+    if (!ch || [ch.UUID.UUIDString caseInsensitiveCompare:@"FFF6"] != NSOrderedSame) return;
+    if (!e) return;                                    // 写成功：不介入，推进交给车回帧
+    SPLog(@"direct", @"★ 写 FFF6 失败：%@ —— 释放本轮", e.localizedDescription);
+    _step = 0; _lastAt = 0; _round++;                  // 作废本轮看门狗 + 清冷却
 }
 
 @end
@@ -651,7 +768,7 @@ static SPUnlocker *gUnlocker = nil;
 static void SPTick(SPUnlocker *u) {
     // ★ 先续期、再干活：否则 armed 还是 NO 时提前 return，循环只跑一次就断
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ SPTick(u); });
+                   SPQueue(), ^{ SPTick(u); });                    // ★ B1
     @try {
         u.ticks++;
         // ★ 心跳：每 8 跳（约 2 分钟）报一次现场，证明插件还活着、外设处于什么状态。
@@ -673,17 +790,19 @@ static void SPTick(SPUnlocker *u) {
 //════════════════════════════ 入口（Theos/logos）════════════════════════════
 %ctor {
     @try {
-        if (access(kKillSwitch, F_OK) == 0) return;      // ★ 安全阀：第一件事
+        // ★ C1：先初始化日志，让"安全阀被检查过"变成可验证事实。1.1.6 的 return 发生在
+        //   日志初始化之前，开关到底有没有被检查，从日志上完全看不出来。
         SPLogInit();
+        NSString *off = SPFind(kKillSwitch);             // ★ 真实根 + rootless + RootHide 隐根
+        if (off) { SPLog(@"boot", @"★ kill-switch 命中（%@）—— 不启动蓝牙", off); return; }
         NSString *bid0 = NSBundle.mainBundle.bundleIdentifier ?: @"(无bundle)";
         SPLog(@"boot", @"════ SundiroSPUnlock v%@ 装载 pid=%d uid=%d bundle=%@ ════",
               SPVER, getpid(), getuid(), bid0);
         if (!SPFlag(@"enable", YES)) { SPLog(@"boot", @"配置为停用，退出"); return; }
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        dispatch_async(SPQueue(), ^{
             @try {
                 gUnlocker = [SPUnlocker new];   // ★ 静态强持有，防被 ARC 回收
-                [gUnlocker start];
-                SPTick(gUnlocker);
+                [gUnlocker start];              // ★ D2：SPTick 已移入 start，只有真起了引擎才跑
             } @catch (NSException *e) {
                 SPLog(@"boot", @"★ 启动异常 %@: %@\n%@", e.name, e.reason,
                       [e.callStackSymbols componentsJoinedByString:@"\n"]);
