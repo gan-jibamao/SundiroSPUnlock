@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.1.1"
+#define SPVER        @"1.1.2"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -326,6 +326,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) BOOL              armed;
 @property (nonatomic, assign) NSTimeInterval    nextScanAt;   // 扫描冷却
 @property (nonatomic, assign) long              ticks;        // 心跳计数
+@property (nonatomic, assign) NSTimeInterval    backoff;      // 重连退避（成功即复位）
 @end
 
 @implementation SPUnlocker
@@ -351,6 +352,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
     //   iOS 只在 Info.plist 声明了 bluetooth-central 后台模式的 App 里允许状态恢复；
     //   SpringBoard 是系统常驻进程，既没这个 key、也**根本不需要**状态恢复
     //   （进程永不退出，无需被系统重新拉起）。这是从 App 版移植过来的历史包袱。
+    _backoff = 1.0;      // ★ 退避初值。绝不依赖 ivar 默认 0 —— 否则 MIN(0,30)=0 秒，会疯狂重连
     NSDictionary *opt = @{ CBCentralManagerOptionShowPowerAlertKey: @NO };
     _cm = [[CBCentralManager alloc] initWithDelegate:self
                                                queue:dispatch_get_global_queue(QOS_CLASS_UTILITY, 0)
@@ -557,6 +559,10 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 
 - (void)centralManager:(CBCentralManager *)cm didConnectPeripheral:(CBPeripheral *)p {
     _connects++;
+    _backoff = 1.0;      // ★ A3：连上了 → 退避归位 1 秒。
+                         //   原来 backoff 是 static 局部变量，只增不减、永不复位，
+                         //   封顶 30 秒后即便连成功几十次也永远 30 秒才重连。
+                         //   官方 App 的 _backoff 是实例变量并在 7 处主动重置。
     _wr = nil; _nt = nil; _step = 0;
     SPLog(@"link", @"✅ 已连接 %@ (累计 %ld 次)", p.name ?: @"(无名)", (long)_connects);
     p.delegate = self;
@@ -578,9 +584,10 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 }
 
 - (void)retryLater:(NSString *)why {
-    static NSTimeInterval backoff = 1.0;
-    NSTimeInterval d = MIN(backoff, 30.0);
-    backoff = MIN(backoff * 2.0, 30.0);
+    // ★ A3：原来这里是 static 局部变量 —— 只增不减、全工程无重置点，封顶后永远 30 秒。
+    //   改实例变量 _backoff，并在 didConnectPeripheral 里复位为 1.0。
+    NSTimeInterval d = MIN(_backoff, 30.0);
+    _backoff = MIN(_backoff * 2.0, 30.0);
     SPLog(@"link", @"%@ → %.0f 秒后重试", why, d);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
