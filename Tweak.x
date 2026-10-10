@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.1"
+#define SPVER        @"1.2.2"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -398,6 +398,8 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) long              ticks;        // 心跳计数
 @property (nonatomic, assign) NSTimeInterval    backoff;      // 重连退避（成功即复位）
 @property (nonatomic, assign) BOOL              connecting;   // ★ B2：连接请求已下发（原子守卫）
+@property (nonatomic, assign) NSTimeInterval    connAt;       // ★ 1.2.2：连接请求下发时刻（守卫卡死判定用）
+@property (nonatomic, assign) NSTimeInterval    guardLogAt;   // ★ 1.2.2：守卫早退日志限流
 @property (nonatomic, assign) NSUInteger        round;        // ★ A1：解锁轮次号（看门狗代际校验）
 @property (nonatomic, assign) NSInteger         stallRetries; // ★ A1：本链路自愈重发次数
 @end
@@ -493,9 +495,21 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     // ★ B2：_car.state 要等 CoreBluetooth 异步处理后才变 Connecting，而三个调用者
     //   （状态回调 / retryLater / SPTick）可能同时通过状态守卫 → 同秒双发 connect。
     //   1.1.6 日志铁证：16:52:40 两条「连接请求」，紧接着 16:52:44 Failed to encrypt。
-    if (_connecting) return;
+    if (_connecting) {
+        // ★ 1.2.2：这条早退原本**完全静默** —— "守卫卡死"只能靠人肉比对心跳网格才能发现
+        //   （1.2.1 真机实证：356 秒 23 次 tryConnect 零日志）。限流 60 秒一条：
+        //   既让卡死自己现形，又绝不刷屏。正常路径进不到这里。
+        NSTimeInterval gnow = SPNow();
+        if (gnow - _guardLogAt > 60.0) {
+            _guardLogAt = gnow;
+            SPLog(@"link", @"连接请求被守卫挡住（已挂 %.0f 秒，外设状态=%ld）",
+                  _connAt > 0 ? gnow - _connAt : -1.0, (long)_car.state);
+        }
+        return;
+    }
     if (_car.state == CBPeripheralStateConnected || _car.state == CBPeripheralStateConnecting) return;
     _connecting = YES;
+    _connAt = SPNow();                                        // ★ 1.2.2：记下发时刻
     SPLog(@"link", @"连接请求 -> %@", _carName ?: _carUUID ?: @"(未知)");
     [_cm connectPeripheral:_car options:nil];
 }
@@ -624,9 +638,29 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     SPLog(@"boot", @"蓝牙状态 = %ld (%@)", (long)cm.state, s);
     if (cm.state == CBManagerStatePoweredOn) {
         _armed = YES;
+        // ★ 1.2.2：蓝牙重新就绪 —— 蓝牙栈重启时系统已作废所有 pending connect，守卫必须复位。
+        //   否则上一个连接请求留下的 _connecting=YES 会把此后每一次 tryConnect 永久挡在门外。
+        _connecting = NO;
         [self tryConnect];
-    } else if (cm.state == CBManagerStateUnauthorized) {
-        SPLog(@"boot", @"★ SpringBoard 未获蓝牙授权 —— 无法使用 CoreBluetooth");
+    } else {
+        if (cm.state == CBManagerStateUnauthorized) {
+            SPLog(@"boot", @"★ SpringBoard 未获蓝牙授权 —— 无法使用 CoreBluetooth");
+        }
+        // ★ 1.2.2：非 PoweredOn（关闭 / 重置 / 不可用）⇒ 系统会取消 pending connect，但
+        //   **不保证回调** didFailToConnectPeripheral。守卫原先只在这三个回调里清零
+        //   （didConnect / didFailToConnect / didDisconnect），一旦不回调用就永久停在 YES，
+        //   此后 tryConnect 在第 496 行静默 return —— 用户观感是「关了下蓝牙，再也不连车」。
+        //   真机铁证（2026-10-10 22:44:27 下发连接请求后即关蓝牙）：
+        //     22:44:27 连接请求 → 蓝牙状态=4 → 22:44:28/45、22:45:00 三次「已开启」全部无声；
+        //     22:46:20 / 22:48:22 心跳「外设状态=0」（Disconnected）；
+        //     22:45:00 → 22:50:56 共 356 秒（SPTick 约 23 次 tryConnect）「连接请求」0 条；
+        //     直到 22:50:56 用户重启用户空间（pid 404）才恢复。
+        //   这里主动作废本轮：复位原子守卫 + 清握手状态，保证蓝牙再开时能立刻重新连车。
+        if (_connecting || _step != 0) {
+            SPLog(@"link", @"蓝牙不可用(%ld) —— 作废本轮连接请求与握手", (long)cm.state);
+        }
+        _connecting = NO; _stallRetries = 0; _round++;
+        _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _lastAt = 0;
     }
 }
 
