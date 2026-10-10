@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.1.3"
+#define SPVER        @"1.1.4"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -365,7 +365,7 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
     if (!_cm || _cm.state != CBManagerStatePoweredOn || _scanning) return;
     NSTimeInterval now = NSDate.date.timeIntervalSince1970;
     if (now < _nextScanAt) return;                 // 冷却期内不扫，省电
-    _nextScanAt = now + 20.0;                      // 一轮扫完歇 20 秒（实测期调快）
+    _nextScanAt = now + 60.0;                      // 一轮扫完歇 60 秒（1.0.7 曾为加速实测改成 20，P1 恢复）
     // ★ 不限定服务 UUID：无法确认车在广播里一定带 FFF0
     //   （App 版靠 retrieve 已知 UUID 连车，**从未真正跑过扫描**，所以这点未经验证）。
     //   改为全扫，再用「已知 UUID」或「名字前缀 SDH-」双重匹配（见 didDiscoverPeripheral）。
