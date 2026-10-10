@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.1.4"
+#define SPVER        @"1.1.6"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -37,7 +37,7 @@
 
 // 服务/特征（实测常量，见 SundiroBLE.m 第 77–78 行）
 static NSString *const kSvcFFF0   = @"0000FFF0-0000-1000-8000-00805F9B34FB";
-static const char *kNamePrefix    = "SDH-";     // 车名实测以 SDH- 开头
+static const char *kNamePrefix    = "SDH-";     // 车名实测以 "SDH-" 开头
 
 // 解锁协议常量（原样抠自 SundiroBLE.m 94–198 行）
 // ── 解锁协议常量（原样抠自 SundiroBLE.m 第 94–198 行）──

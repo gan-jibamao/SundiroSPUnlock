@@ -1,7 +1,11 @@
 # SundiroSPUnlock
 
-把「新大洲本田」蓝牙无感解锁**独立成 SpringBoard 插件**，不再依赖官方 App。
+把「新大洲本田」蓝牙**无感解锁**独立成 **SpringBoard 插件**，不再依赖官方 App。
 车况遥测 / 小组件 / 深链控制仍由官方 App 侧组件负责，两者互不干扰。
+
+**当前版本：1.1.4** ｜ 支持 `iphoneos-arm64e`（RootHide）与 `iphoneos-arm64`（rootless）
+
+---
 
 ## 为什么能独立
 
@@ -14,6 +18,36 @@
 | 32 字节常量 | 硬编码 |
 | 服务/特征 UUID | `FFF0 / FFF1 / FFF6`（硬编码） |
 | 网络 / token / 官方 App | **完全不需要** |
+
+**核心机制**：iOS 会无限期保持一个「挂起的蓝牙连接」（pending connect）。
+插件在 SpringBoard 里挂上它，车一进入范围 iOS 就自动完成连接，插件立刻发四帧解锁。
+
+> 官方 App 也能做这件事，但**会被 iOS 挂起**。**SpringBoard 永远不会被挂起** —— 这就是独立成插件的意义。
+> 实测：pending connect 存活 **6 小时 26 分**，期间零人工干预，车一出现即连上并解锁。
+
+---
+
+## 实测数据
+
+| 指标 | 实测值 |
+|:--|:--|
+| pending connect 存活 | **6 小时 26 分**（另一次 2 小时 50 分） |
+| 解锁握手耗时 | **1256 ~ 2297 ms**（官方 App 版 2116 ms） |
+| 待机耗电 | 9 小时 **0 次扫描 / 0 次连接**（仅挂 pending connect） |
+| 定时器 | 15 秒一跳；iOS 会主动合并（实测 568 跳仅触发 71 次心跳） |
+
+---
+
+## 修复记录
+
+| # | 问题 | 根因 | 状态 |
+|:--|:--|:--|:--|
+| **A1** | 车已解锁仍每 30 秒重发四帧（实测 8 分钟 17 次） | `_doneLink` 是死守卫——只读、从未赋值，判重恒为假 | ✅ 真机验证：修复后严格 1:1 |
+| **A2** | `订阅 FFF1` / `写特征就绪` 1 秒内刷 4 次 | `didDiscoverCharacteristicsForService` 被多次回调 | ✅ 真机验证：降为 1 次 |
+| **A3** | 重连退避只增不减，封顶后**永久锁死 30 秒** | `backoff` 是 `static` 局部变量，全工程无重置点 | ✅ 真机验证：断开后回到 `1 秒` |
+| **P1** | 扫描占空比 83%（偏耗电） | 1.0.7 为加速实测把冷却从 60s 改成 20s，未改回 | ✅ 已恢复 60s（占空比 → 42%） |
+
+---
 
 ## 构建
 
@@ -30,33 +64,68 @@ CI 同时产出：
 | `roothide` | `iphoneos-arm64e` | **RootHide / Dopamine-roothide** |
 | `rootless` | `iphoneos-arm64` | Dopamine（传统 rootless） |
 
+> ⚠️ 两个架构**不可同时安装**。
+
+---
+
 ## 安装
 
-用 **Sileo / Zebra** 安装（不要用 `dpkg -i`——那样会跳过 RootHide 的安装钩子），
-装完 `killall -9 SpringBoard`。
+用 **Sileo / Zebra** 安装（不要用 `dpkg -i` —— 那样会跳过 RootHide 的安装钩子），
+装完执行 `killall -9 SpringBoard`。
+
+---
 
 ## 验证
 
-**注意 roothide 的路径语义**：bootstrap 命令行工具只认 jbroot 路径，
-真实 iOS 文件系统在 `/rootfs/`。本插件是**普通 clang/ObjC**（未用 vroot），
-它写的是**真实路径**，所以从终端要看：
+装好后到车附近，重启桌面并看日志：
 
 ```sh
-cat /rootfs/var/mobile/Library/Logs/sundirosp.log
+killall -9 SpringBoard
+cat /var/mobile/Library/Logs/sundirosp.log
 ```
 
-期望看到：
+**期望看到**（真实日志节选）：
 
 ```
-════ SundiroSPUnlock v1.0.3 装载 pid=xxx uid=501 bundle=com.apple.springboard ════
+════ SundiroSPUnlock v1.1.4 装载 pid=9343 uid=501 bundle=com.apple.springboard ════
 蓝牙状态 = 5 (已开启)
-认车 SDH-xxxxxx — 名字命中
-✅ 已连接 …
--> 解锁帧 1/4 … 4/4
-★ 四帧发完
+车辆 UUID = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+retrieve 已知 UUID 命中 1 个外设
+认车 SDH-xxxxxx (…) — retrieve
+连接请求 -> SDH-xxxxxx
+✅ 已连接 SDH-xxxxxx (累计 1 次)
+服务 FFF0
+订阅 FFF1（车的回帧从这条来）
+写特征 FFF6 就绪 → 立刻直发
+-> 解锁帧 1/4（配对 #0） … 4/4
+★ 四帧发完 —— 耗时 1347 ms（累计成功 1 次）
 ```
 
-同时插件也会写 NSLog（统一日志）与另外 5 个候选路径，不怕单一沙盒拦截。
+**日志标签速查**
+
+| 标签 | 含义 |
+|:--|:--|
+| `[boot]` | 启动 / 装载 / 蓝牙状态 |
+| `[probe]` | 车辆 UUID / 车名读取过程 |
+| `[link]` | 扫描 / 认车 / 连接 / 断开 / 重试 |
+| `[gatt]` | 服务与特征发现 / FFF1 订阅状态 |
+| `[direct]` | 四帧握手推进 |
+| `[car]` | 车的回帧 |
+| `[life]` | 每 2 分钟心跳（含外设状态） |
+
+> **找不到日志？** 插件同时写 `NSLog`（可在 Console 查看），并内置另外 **5 个候选路径**
+> （`/var/mobile/Library/Preferences/com.jibamao.spsundiro.log`、`/var/mobile/Documents/`、
+> `/var/jb/var/mobile/Library/Logs/`、`/tmp/`、`/var/tmp/`），不怕单一沙盒拦截。
+
+**心跳怎么读**
+
+| 心跳字段 | 含义 |
+|:--|:--|
+| `外设状态=1` | Connecting（正在等车） |
+| `外设状态=2` | Connected（已连上） |
+| `已连=N` / `已解锁=M` | 累计连接次数 / 累计成功解锁次数；**两者应 1:1**（A1 门禁） |
+
+---
 
 ## 控制
 
@@ -64,7 +133,10 @@ cat /rootfs/var/mobile/Library/Logs/sundirosp.log
 |:--|:--|
 | 立即停用 | `touch /var/mobile/Library/Preferences/com.jibamao.spsundiro.off` 后 `killall -9 SpringBoard` |
 | 恢复 | `rm /var/mobile/Library/Preferences/com.jibamao.spsundiro.off` |
+| 只关解锁（保持连接） | 偏好域 `com.jibamao.spsundiro` 写 `unlock = NO` |
 | 卸载 | Sileo 卸载，或删 `DynamicLibraries/SundiroSPUnlock.{dylib,plist}` |
+
+---
 
 ## 安全设计
 
@@ -74,13 +146,27 @@ SpringBoard 崩 = 注销，开机崩 = 白苹果循环，因此：
 2. 全部逻辑在后台队列，**不阻塞 SpringBoard 启动路径**
 3. 逐层 `@try/@catch`，异常绝不外泄
 4. **不做任何 swizzle**（纯新增行为）
-5. 非 busy-loop：退避 1→30 秒 + 解锁冷却 20 秒 + 同链路只发一轮
+5. 非 busy-loop —— 15 秒 tick + 退避 1→30 秒（**连上即复位**）+ 解锁冷却 20 秒 + 同链路只发一轮
+
+---
 
 ## 过滤器
 
 ```xml
-Filter = { Bundles = [com.apple.springboard, com.apple.Preferences], Executables = [SpringBoard] }
+Filter = { Bundles = [com.apple.springboard], Executables = [SpringBoard] }
 ```
 
-`com.apple.Preferences` 是**对照组**：打开「设置」若能出日志，说明注入链路通，
-只有 SpringBoard 不出则问题在 SpringBoard 专属策略。上线后可删掉这一项。
+---
+
+## 已知限制
+
+- **与官方 App 会抢链路** —— 建议用前把官方 App 从后台划掉。
+- 日志中偶见 `Failed to encrypt the connection` —— 在官方 App 版日志里也出现过，归因**蓝牙弱信号**；
+  另一常见诱因是**同时有另一个 central 连着车**。二者无法从日志区分。
+- 「车 UUID 未知」时（App 从未连过车）会进入扫描模式，认车最多多等 60 秒。
+
+---
+
+## 许可证
+
+[MIT](LICENSE)

@@ -7,9 +7,6 @@
 		<key>Bundles</key>
 		<array>
 			<string>com.apple.springboard</string>
-			<!-- 对照组：注入「设置」App。打开设置若能出日志，说明注入链路是通的，
-			     只有 SpringBoard 不出则问题在 SpringBoard 专属策略。上线后可删。 -->
-			<string>com.apple.Preferences</string>
 		</array>
 		<key>Executables</key>
 		<array>
