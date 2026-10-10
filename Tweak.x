@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.1.0"
+#define SPVER        @"1.1.1"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -487,6 +487,10 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
           forCharacteristic:_wr type:CBCharacteristicWriteWithResponse];
             SPLog(@"direct", @"-> 解锁帧 4/4");
             _unlocks++;
+            // ★ A1 修复：本链路已解锁，打上记号 —— 否则直发守卫第 437 行恒为假，
+            //   车早已解开却每 ~30 秒（SPTick 15s × 20s 冷却）重发一轮四帧。
+            //   断开时 didDisconnectPeripheral 会把它清 0，下次靠近照样解锁。
+            _doneLink = _linkAt;
             SPLog(@"direct", @"★ 四帧发完 —— 耗时 %.0f ms（累计成功 %ld 次）",
                   (NSDate.date.timeIntervalSince1970 - _startAt) * 1000.0, (long)_unlocks);
             _step = 0;
@@ -594,6 +598,8 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 
 - (void)peripheral:(CBPeripheral *)p
 didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
+    // ★ A2：这两个特征已经拿全了 —— 重复回调不再刷日志、不再重复订阅
+    if (_wr && _nt) return;
     for (CBCharacteristic *c in svc.characteristics) {
         if ([c.UUID.UUIDString caseInsensitiveCompare:@"FFF6"] == NSOrderedSame) _wr = c;
         if ([c.UUID.UUIDString caseInsensitiveCompare:@"FFF1"] == NSOrderedSame) _nt = c;
