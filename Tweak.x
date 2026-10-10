@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.2"
+#define SPVER        @"1.2.3"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -496,14 +496,26 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     //   （状态回调 / retryLater / SPTick）可能同时通过状态守卫 → 同秒双发 connect。
     //   1.1.6 日志铁证：16:52:40 两条「连接请求」，紧接着 16:52:44 Failed to encrypt。
     if (_connecting) {
-        // ★ 1.2.2：这条早退原本**完全静默** —— "守卫卡死"只能靠人肉比对心跳网格才能发现
-        //   （1.2.1 真机实证：356 秒 23 次 tryConnect 零日志）。限流 60 秒一条：
-        //   既让卡死自己现形，又绝不刷屏。正常路径进不到这里。
+        // ★ 1.2.3：分档限流 —— 只对「卡死特征」高声告警，健康挂起只低频记录。
+        //   （1.2.2 原来只按 60 秒一刀切，未区分两种情形，自我变成了噪声源）
+        //   判据来自 1.2.2 真机实证（2026-10-11 00:03–01:04）：
+        //     · 外设状态=1（Connecting）⇒ iOS 仍持有 pending connect，**健康**，等车唤醒即可；
+        //       1.2.2 曾在一次 61 分钟的健康挂起里刷了 64 条（≈48 条/小时），淹没真实事件，
+        //       并会加速 512 KB 日志轮转，把可用于诊断的历史挤掉。
+        //     · 外设状态=0（Disconnected）而守卫仍挂着 ⇒ **卡死**（蓝牙关闭丢回调的那一类）。
+        //   本条早退仍是零控制流改动：只决定「打不打日志」，不影响任何行为。
         NSTimeInterval gnow = SPNow();
-        if (gnow - _guardLogAt > 60.0) {
+        NSTimeInterval held = _connAt > 0 ? gnow - _connAt : -1.0;
+        if (_car.state == CBPeripheralStateDisconnected) {
+            if (held > 30.0 && gnow - _guardLogAt > 60.0) {       // 卡死：高声、60 秒限流
+                _guardLogAt = gnow;
+                SPLog(@"link", @"★ 守卫疑似卡死（已挂 %.0f 秒，外设未在连接，状态=%ld）",
+                      held, (long)_car.state);
+            }
+        } else if (gnow - _guardLogAt > 600.0) {                  // 健康挂起：10 分钟一条，中性措辞
             _guardLogAt = gnow;
-            SPLog(@"link", @"连接请求被守卫挡住（已挂 %.0f 秒，外设状态=%ld）",
-                  _connAt > 0 ? gnow - _connAt : -1.0, (long)_car.state);
+            SPLog(@"link", @"连接请求仍在挂起（已挂 %.0f 秒，外设状态=%ld）",
+                  held, (long)_car.state);
         }
         return;
     }
