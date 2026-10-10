@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.0"
+#define SPVER        @"1.2.1"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -541,8 +541,15 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         NSTimeInterval now = SPNow();                  // ★ C3：单调时钟
         // 同一条链路已完整发过一轮 → 不再重复（车早就解开了）
         if (_doneLink > 0 && _linkAt > 0 && fabs(_doneLink - _linkAt) < 0.001) return;
-        // 冷却 20 秒：断/连抖动时不刷帧
-        if (_lastAt > 0 && now - _lastAt < 20.0) return;
+        // 冷却 20 秒：只作**同链路**防抖兜底。链路一断 _lastAt 即归零（见 didDisconnectPeripheral），
+        // 所以新链路永远不会被上一轮的冷却挡住。本条排在 _doneLink 守卫之后，不会在
+        // 「本轮已发完」的 15 秒轮询里刷屏。
+        // ★ 1.2.1：这个分支原来零日志 —— 正是它把「按一次不开、要按两次」藏了整整一个版本。
+        if (_lastAt > 0 && now - _lastAt < 20.0) {
+            SPLog(@"direct", @"直发被同链路冷却挡住（还剩 %.1f 秒）—— 交给下一拍补发",
+                  20.0 - (now - _lastAt));
+            return;
+        }
 
         _lastAt = now;
         _startAt = now;
@@ -685,6 +692,13 @@ didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 - (void)centralManager:(CBCentralManager *)cm
 didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
     _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0;
+    // ★ 1.2.1：冷却锚点也必须随链路作废。1.2.0 在这里清了一堆状态却漏了 _lastAt，
+    //   导致「发到一半链路被断 → 立刻重连 → 新链路就绪」时，directBegin 被上一条链路的
+    //   20 秒冷却在第 545 行静默 return（零日志），只能等 SPTick 下一拍补发。
+    //   真机铁证（2026-10-10 日志）：20:37:31 就绪 → 20:37:59 才发出帧1（+28s，正是用户
+    //   「按了两次」的那一回）；21:09:23 就绪 → 21:09:34 才发出（+11s，恰为定时器第 701 拍）。
+    //   断开即新一轮，新链路必须能立刻直发。
+    _lastAt = 0;                                        // ★ 1.2.1：清冷却，新链路不受上一轮影响
     _connecting = NO; _stallRetries = 0; _round++;      // ★ B2/A1：链路已断，守卫与看门狗全作废
     SPLog(@"link", @"⚠️ 断开：%@", e ? e.localizedDescription : @"主动/正常断开");
     [self retryLater:@"断开"];
@@ -724,7 +738,10 @@ didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
     }
     if (_wr) {
         _linkAt = SPNow();                             // ★ C3：记号：本链路
-        SPLog(@"gatt", @"写特征 FFF6 就绪 → 立刻直发");
+        // ★ 1.2.1：原文案「→ 立刻直发」是**提前宣称**——它先喊再调 directBegin，喊完可能
+        //   什么都不发（1.2.0 就被冷却吞过 3 次），结果日志口径比实际行为更"乐观"，
+        //   上一轮"订阅/就绪/帧1/完成 计数自洽"的审计因此漏判。改为只陈述事实。
+        SPLog(@"gatt", @"写特征 FFF6 就绪 —— 请求直发");
         [self directBegin];
     }
 }
