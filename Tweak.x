@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.1.2"
+#define SPVER        @"1.1.3"
 #define kKillSwitch  "/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf "/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
