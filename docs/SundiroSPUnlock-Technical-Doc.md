@@ -52,7 +52,8 @@
 | `SundiroSPUnlock-1.2.4-Source.zip` | — | 完整干净源码 |
 | `SHA256SUMS` | — | 校验文件 |
 
-> 资产 sha256（与 CI 产出逐字节复核一致）：构建产出后回填。
+> 资产 sha256（与 CI 产出逐字节复核一致）：
+> arm64e deb `cf798dbb…` ｜ arm64 deb `6d59661f…` ｜ Source.zip `e6baa1e0…`
 > 上一版 1.2.3 资产 sha256：arm64e `60f1e1d0…` ｜ arm64 `7855fa62…` ｜ Source.zip `fc92fcef…`
 >
 > **已上架自建 Sileo 源**：`https://gan-jibamao.github.io/`
