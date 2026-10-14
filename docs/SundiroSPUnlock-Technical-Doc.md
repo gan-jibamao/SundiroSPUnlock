@@ -854,6 +854,22 @@ v1.1.6 段 14 次解锁：min 1970 / median 2693 / max 5640 ms，成功率 100%
 | 二进制核验 | `dispatch_get_global_queue` **已彻底消失**；新增 `clock_gettime`、`dispatch_queue_create` |
 | 本地门禁 | 双架构编译零警告；协议数据段 sha256 与 1.1.6 一致 |
 
+### 16.6b 1.2.4 构建与交付记录（2026-10-14）
+
+| 项 | 结果 |
+|:--|:--|
+| 提交 | `ee62d77`（文档回填 `85fb491`） |
+| CI run | `38551479487` / `38551988566`（Theos 双 scheme）**success** |
+| arm64e deb | `com.jibamao.spsundiro_1.2.4_iphoneos-arm64e.deb` sha `cf798dbb…` |
+| arm64 deb | `com.jibamao.spsundiro_1.2.4_iphoneos-arm64.deb` sha `6d59661f…` |
+| 源码包 | `SundiroSPUnlock-1.2.4-Source.zip` sha `e6baa1e0…`（17 文件） |
+| 载荷路径 | arm64e → `/Library/MobileSubstrate/DynamicLibraries/`；arm64 → `/var/jb/Library/MobileSubstrate/DynamicLibraries/` ✓ |
+| 维护脚本 | 无（仅 `control`）→ 无路径转换风险 ✓ |
+| 二进制核验 | 双切片 LC_UUID/签名哈希外的差异 **0 字节**；1.2.4 门禁日志串（`★★ 未见 42` 等）已入二进制 ✓ |
+| 协议核验 | **1568 字节配对表 + 32 字节常量在双架构四切片逐字节命中**（协议零改动铁证）|
+| 两次构建对撞 | dylib 差异仅 136 字节 = 2 切片 × (LC_UUID 16B + 签名 SHA1 20B + SHA256 32B)，均为构建期随机标识，语义等价 ✓ |
+| 交付位置 | `/var/minis/attachments/SundiroSPUnlock-1.2.4/`（deb ×2 + Source.zip + SHA256SUMS + README）|
+
 ### 16.7 ★ 真机验收门禁（装 1.2.0 后必查）
 
 | # | 判据 | 通过标准 |
