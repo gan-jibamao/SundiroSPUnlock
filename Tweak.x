@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.3"
+#define SPVER        @"1.2.4"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -402,6 +402,8 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) NSTimeInterval    guardLogAt;   // ★ 1.2.2：守卫早退日志限流
 @property (nonatomic, assign) NSUInteger        round;        // ★ A1：解锁轮次号（看门狗代际校验）
 @property (nonatomic, assign) NSInteger         stallRetries; // ★ A1：本链路自愈重发次数
+@property (nonatomic, assign) BOOL              saw42;        // ★ 1.2.4：本轮是否见过 42 帧（车端受理凭证）
+@property (nonatomic, assign) NSTimeInterval    no42At;       // ★ 1.2.4：上次因未见42主动换链时刻（60秒节流）
 @end
 
 static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动，需前向声明
@@ -580,6 +582,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         _lastAt = now;
         _startAt = now;
         _round++;                                      // ★ A1：新一轮 → 作废上一轮的看门狗
+        _saw42 = NO;                                   // ★ 1.2.4：新一轮开始，重置 42 凭证
         const unsigned char *R = kUnlockPairs[_pick % kUnlockPairCount].r;
         _pick++;
         unsigned char pay[48];
@@ -599,6 +602,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     @try {
         if (_step == 0) return;
         NSUInteger L = d.length;
+        if (L == 42) _saw42 = YES;   // ★ 1.2.4：车端受理凭证 —— 整轮见过 42 才视为会话被接受
         if (_step == 1 && (L == 26 || L == 42)) {
             _step = 2;
             [_car writeValue:SPFrame(0x00, 0x01, 0x00, 0xFA, NULL, 0)
@@ -623,13 +627,37 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
           forCharacteristic:_wr type:CBCharacteristicWriteWithResponse];
             SPLog(@"direct", @"-> 解锁帧 4/4");
             [self armWatchdog:4];                      // ★ A1
+
+            // ★ 1.2.4：完成门禁 —— 42 帧 = 车端受理凭证。若整轮从未见 42
+            //   （16:04 真机铁证：26/26/26，按车钮无反应），本轮不得标完成；
+            //   清冷却让心跳拍补发，并按 60 秒节流主动换链（正是当时自然恢复的路径）。
+            if (!_saw42) {
+                _step = 0; _lastAt = 0;                // 不标完成、清冷却，允许同链路补发
+                NSTimeInterval gnow = SPNow();
+                if (gnow - _no42At > 60.0) {           // 换链节流：60 秒最多一次
+                    _no42At = gnow;
+                    SPLog(@"direct", @"★★ 四帧发完但全程未见 42 —— 车端未受理，1.5 秒后主动换链重来");
+                    NSUInteger gen = _round;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(1.5 * NSEC_PER_SEC)),
+                                   SPQueue(), ^{
+                        if (self->_round != gen) return;               // 已被新流程接管
+                        if (self->_car.state != CBPeripheralStateConnected) return;
+                        [self->_cm cancelPeripheralConnection:self->_car];  // → 自动重连 → 全新会话
+                    });
+                } else {
+                    SPLog(@"direct", @"★★ 未见 42（换链节流中）—— 交由心跳拍继续尝试");
+                }
+                return;
+            }
+
             _unlocks++;
             // ★ A1 修复：本链路已解锁，打上记号 —— 否则直发守卫第 437 行恒为假，
             //   车早已解开却每 ~30 秒（SPTick 15s × 20s 冷却）重发一轮四帧。
             //   断开时 didDisconnectPeripheral 会把它清 0，下次靠近照样解锁。
             _doneLink = _linkAt;
             _stallRetries = 0;                         // ★ A1：本轮链路自愈计数归零
-            SPLog(@"direct", @"★ 四帧发完 —— 耗时 %.0f ms（累计成功 %ld 次）",
+            SPLog(@"direct", @"★ 四帧发完（42 已确认）—— 耗时 %.0f ms（累计成功 %ld 次）",
                   (SPNow() - _startAt) * 1000.0, (long)_unlocks);   // ★ C3
             _step = 0;
         }
@@ -671,7 +699,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         if (_connecting || _step != 0) {
             SPLog(@"link", @"蓝牙不可用(%ld) —— 作废本轮连接请求与握手", (long)cm.state);
         }
-        _connecting = NO; _stallRetries = 0; _round++;
+        _connecting = NO; _stallRetries = 0; _round++; _saw42 = NO;
         _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _lastAt = 0;
     }
 }
@@ -717,6 +745,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     _connects++;
     _connecting = NO;    // ★ B2：连接已落地，守卫复位
     _stallRetries = 0;   // ★ A1：新链路，自愈计数归零
+    _saw42 = NO;         // ★ 1.2.4：新链路，42 凭证复位
     _backoff = 1.0;      // ★ A3：连上了 → 退避归位 1 秒。
                          //   原来 backoff 是 static 局部变量，只增不减、永不复位，
                          //   封顶 30 秒后即便连成功几十次也永远 30 秒才重连。
@@ -737,7 +766,7 @@ didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 
 - (void)centralManager:(CBCentralManager *)cm
 didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
-    _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0;
+    _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _saw42 = NO;
     // ★ 1.2.1：冷却锚点也必须随链路作废。1.2.0 在这里清了一堆状态却漏了 _lastAt，
     //   导致「发到一半链路被断 → 立刻重连 → 新链路就绪」时，directBegin 被上一条链路的
     //   20 秒冷却在第 545 行静默 return（零日志），只能等 SPTick 下一拍补发。
