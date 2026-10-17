@@ -27,16 +27,12 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.5"
+#define SPVER        @"1.2.4"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
 #define kPrefsSuite  @"com.jibamao.spsundiro"
 #define kLogMax      (512 * 1024)
-// ★ 1.2.5：车帧 hex 采样开关（遗留缺口 #1）。该文件存在 → 车回帧日志带 hex；
-//   删掉即恢复 1.2.4 纯 len= 口径，**无需重新打包安装**。
-//   目的：诊断「车重新上锁 / 按键唤醒」场景期间打开；诊断结束后 rm 即可关。
-#define kHexFlagPath "/var/mobile/Library/Logs/sundirosp.hex"
 
 // 车名前缀（实测常量，见 SundiroBLE.m 第 77–78 行）
 static const char *kNamePrefix    = "SDH-";     // 车名实测以 "SDH-" 开头
@@ -362,33 +358,6 @@ static NSString *SPKnownVehicleUUID(void) {
 
 static NSString *SPKnownVehicleName(void) {
     return SPReadPref(@"sb.vehicle.name");
-}
-
-//──────────────────── 车帧 hex 转储（1.2.5 · 遗留缺口 #1）────────────────────
-//  ★ 为什么要单独写函数而不是就地拼字符串：车回帧走蓝牙串行队列（SPQueue），
-//    SPLog 内部是 fopen → fwrite → fflush → fclose 的同步落盘；同一队列上还挂着
-//    CBCentralManager 的回调。格式化必须自己封死上限 —— 绝不能让长字符串拼接
-//    把蓝牙队列拖住。
-//  ★★ 上限取 48 字节（而非 32）：实车回帧只有 26 / 42 两种长度，42 帧是「车端受理
-//     凭证」——整轮唯一、且是门禁判定依据，**必须看全 42 字节**。32 字节上限会把
-//     42 帧的后 10 字节截掉，等于把最关键的信息丢掉。48 = 144 字符封顶，代价可忽略。
-//  ★★ 缓冲尺寸必须 ≥ 48*3 + 1 = 145：48 字节 × 每字节 3 字符（"xx "）+ 末尾 '\0'。
-//     取 160 留余量。原来按 32 字节算出的 96 会在实车 42 帧上越界 1 字节
-//     —— 已用 canary 守卫字节法实测：96 字节缓冲在 32~48 字节输入上 17/17 全部越界。
-static NSString *SPHexPreview(NSData *d) {
-    if (!d || d.length == 0) return @"";
-    const unsigned char *b = (const unsigned char *)d.bytes;
-    NSUInteger n = MIN((NSUInteger)48, d.length);
-    char buf[160];
-    char *p = buf;
-    for (NSUInteger i = 0; i < n; i++) {
-        snprintf(p, 4, "%02x ", b[i]);
-        p += 3;
-    }
-    if (p > buf) p[-1] = '\0';                     // 去掉末尾那个空格
-    NSString *s = [NSString stringWithUTF8String:buf];
-    if (d.length > n) s = [s stringByAppendingFormat:@"…(+%lu)", (unsigned long)(d.length - n)];
-    return s ?: @"";
 }
 
 //──────────────────────── 造帧（与 App 侧逐行一致）────────────────────────
@@ -862,19 +831,7 @@ didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)ch error:(NSErro
 - (void)peripheral:(CBPeripheral *)p
 didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
     if (!ch.value || ch.value.length == 0) return;
-    // ★ 1.2.5：车回帧 hex 采样 —— 解决遗留缺口 #1（「车重新上锁 / 按键唤醒」场景
-    //   只有 len= 没有字节内容，无法诊断）。上限 48 字节，实车 26 / 42 两种长度全部完整。
-    //   ★ len= 必须原样保留在最前：历次判读解析器（parse_sp.py）全靠 re.search('len=(\d+)')，
-    //     格式一变全部历史脚本失效。
-    //   ★ 开关探测：每次回帧只做一次 access()（微秒级），换取「建/删文件即时生效」。
-    //     不做 static 缓存 —— 静态缓存必须 respring 才能重新探测，诊断时太别扭。
-    BOOL hexOn = (access(kHexFlagPath, F_OK) == 0);
-    if (hexOn) {
-        SPLog(@"car", @"← 车回帧 %@ len=%lu hex=[%@]", ch.UUID.UUIDString,
-              (unsigned long)ch.value.length, SPHexPreview(ch.value));
-    } else {
-        SPLog(@"car", @"← 车回帧 %@ len=%lu", ch.UUID.UUIDString, (unsigned long)ch.value.length);
-    }
+    SPLog(@"car", @"← 车回帧 %@ len=%lu", ch.UUID.UUIDString, (unsigned long)ch.value.length);
     [self onCarFrame:ch.value];
 }
 
