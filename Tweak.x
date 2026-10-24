@@ -590,6 +590,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         // ★ 1.2.6：原实现是「本链路永久封死」，实测封死中位 126 秒、最长 20.7 分钟，
         //   78% 的轮次封死超过 30 秒 —— 这期间用户按实体开关，插件零动作零日志。
         //   改为 12 秒时效窗 + 同链路最多补发 2 次。
+        NSTimeInterval doneAge = -1.0;                 // ★ 1.2.6：待补发时记下完成时长
         if (_doneLink > 0 && _linkAt > 0 && fabs(_doneLink - _linkAt) < 0.001) {
             NSTimeInterval age = (_doneAt > 0) ? (now - _doneAt) : 1e9;
             if (age < 12.0 || _redoOnLink >= 2) {
@@ -600,18 +601,22 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
                 }
                 return;
             }
-            _redoOnLink++;
-            SPLog(@"direct", @"本链路已完成 %.0f 秒 —— 允许补发（第 %ld 次）",
-                  age, (long)_redoOnLink);
+            doneAge = age;                             // ★ 1.2.6：先不计数 —— 被冷却挡住不消耗额度
         }
         // 冷却 20 秒：只作**同链路**防抖兜底。链路一断 _lastAt 即归零（见 didDisconnectPeripheral），
         // 所以新链路永远不会被上一轮的冷却挡住。本条排在 _doneLink 守卫之后，不会在
         // 「本轮已发完」的 15 秒轮询里刷屏。
         // ★ 1.2.1：这个分支原来零日志 —— 正是它把「按一次不开、要按两次」藏了整整一个版本。
-        if (_lastAt > 0 && now - _lastAt < 20.0) {
+        NSTimeInterval cool = (doneAge >= 0.0) ? 10.0 : 20.0;   // ★ 1.2.6：补发只需再等 10 秒（完成已满 12 秒）
+        if (_lastAt > 0 && now - _lastAt < cool) {
             SPLog(@"direct", @"直发被同链路冷却挡住（还剩 %.1f 秒）—— 交给下一拍补发",
-                  20.0 - (now - _lastAt));
+                  cool - (now - _lastAt));
             return;
+        }
+        if (doneAge >= 0.0) {                          // ★ 1.2.6：真正要发出去才消耗补发额度
+            _redoOnLink++;
+            SPLog(@"direct", @"本链路已完成 %.0f 秒 —— 允许补发（第 %ld 次）",
+                  doneAge, (long)_redoOnLink);
         }
 
         _lastAt = now;
