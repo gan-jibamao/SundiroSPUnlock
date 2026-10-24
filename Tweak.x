@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.6"
+#define SPVER        @"1.2.7"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -409,6 +409,8 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) NSTimeInterval    dirLogAt;     // ★ 1.2.6：directBegin 早退日志限流
 @property (nonatomic, assign) BOOL              fullDiscovery;// ★ 1.2.6：是否已退回全量 GATT 发现
 @property (nonatomic, assign) BOOL              fff0CharsDone; // ★ 1.2.6：本链路 FFF0 的特征是否已回
+@property (nonatomic, assign) NSTimeInterval    lastCarAt;     // ★ 1.2.7：上一条车帧时刻（判按键间隔）
+@property (nonatomic, assign) BOOL              forceSend;     // ★ 1.2.7：按键触发，绕过完成门禁与冷却
 @end
 
 static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动，需前向声明
@@ -586,37 +588,32 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
             return;
         }
         NSTimeInterval now = SPNow();                  // ★ C3：单调时钟
-        // 同一条链路已完整发过一轮 → 时效窗内不重复（车早就解开了）
+        // 同一条链路已完整发过一轮 → 不再无条件重发（车早就解开了）。
         // ★ 1.2.6：原实现是「本链路永久封死」，实测封死中位 126 秒、最长 20.7 分钟，
         //   78% 的轮次封死超过 30 秒 —— 这期间用户按实体开关，插件零动作零日志。
-        //   改为 12 秒时效窗 + 同链路最多补发 2 次。
-        NSTimeInterval doneAge = -1.0;                 // ★ 1.2.6：待补发时记下完成时长
-        if (_doneLink > 0 && _linkAt > 0 && fabs(_doneLink - _linkAt) < 0.001) {
+        // ★ 1.2.7：改为「按键帧触发」—— 空闲期车主动发帧才发，定时器仅留 90 秒兜底 1 次。
+        // ★ 1.2.7：本链路已完成后 —— 只认「车主动发帧（实体开关）」触发；
+        //   定时器不再补发（1.2.6 实测 30 秒内自发 2 轮，纯属白烧），仅保留 90 秒兜底 1 次。
+        if (_doneLink > 0 && _linkAt > 0 && fabs(_doneLink - _linkAt) < 0.001 && !_forceSend) {
             NSTimeInterval age = (_doneAt > 0) ? (now - _doneAt) : 1e9;
-            if (age < 12.0 || _redoOnLink >= 2) {
+            if (age < 90.0 || _redoOnLink >= 1) {
                 if (now - _dirLogAt > 5.0) {
                     _dirLogAt = now;
-                    SPLog(@"direct", @"直发被「本链路已完成」挡住（完成于 %.1f 秒前，补发 %ld/2）",
-                          age, (long)_redoOnLink);
+                    SPLog(@"direct", @"直发被「本链路已完成」挡住（完成于 %.0f 秒前，等车帧触发）", age);
                 }
                 return;
             }
-            doneAge = age;                             // ★ 1.2.6：先不计数 —— 被冷却挡住不消耗额度
+            _redoOnLink++;
+            SPLog(@"direct", @"★ 90 秒无按键帧 —— 兜底补发 1 次");
         }
         // 冷却 20 秒：只作**同链路**防抖兜底。链路一断 _lastAt 即归零（见 didDisconnectPeripheral），
         // 所以新链路永远不会被上一轮的冷却挡住。本条排在 _doneLink 守卫之后，不会在
         // 「本轮已发完」的 15 秒轮询里刷屏。
         // ★ 1.2.1：这个分支原来零日志 —— 正是它把「按一次不开、要按两次」藏了整整一个版本。
-        NSTimeInterval cool = (doneAge >= 0.0) ? 10.0 : 20.0;   // ★ 1.2.6：补发只需再等 10 秒（完成已满 12 秒）
-        if (_lastAt > 0 && now - _lastAt < cool) {
+        if (!_forceSend && _lastAt > 0 && now - _lastAt < 20.0) {
             SPLog(@"direct", @"直发被同链路冷却挡住（还剩 %.1f 秒）—— 交给下一拍补发",
-                  cool - (now - _lastAt));
+                  20.0 - (now - _lastAt));
             return;
-        }
-        if (doneAge >= 0.0) {                          // ★ 1.2.6：真正要发出去才消耗补发额度
-            _redoOnLink++;
-            SPLog(@"direct", @"本链路已完成 %.0f 秒 —— 允许补发（第 %ld 次）",
-                  doneAge, (long)_redoOnLink);
         }
 
         _lastAt = now;
@@ -841,7 +838,7 @@ didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
     BOOL gattReady = (_wr != nil);                      // ★ 1.2.6：必须在清 _wr 之前取
     _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _saw42 = NO;
-    _doneAt = 0; _redoOnLink = 0;                       // ★ 1.2.6：新链路，时效窗与补发计数作废
+    _doneAt = 0; _redoOnLink = 0; _lastCarAt = 0;       // ★ 1.2.7：新链路，时效窗/补发计数/车帧时刻作废
     // ★ 1.2.1：冷却锚点也必须随链路作废。1.2.0 在这里清了一堆状态却漏了 _lastAt，
     //   导致「发到一半链路被断 → 立刻重连 → 新链路就绪」时，directBegin 被上一条链路的
     //   20 秒冷却在第 545 行静默 return（零日志），只能等 SPTick 下一拍补发。
@@ -919,6 +916,28 @@ didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)ch error:(NSErro
 didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
     if (!ch.value || ch.value.length == 0) return;
     SPLog(@"car", @"← 车回帧 %@ len=%lu", ch.UUID.UUIDString, (unsigned long)ch.value.length);
+    // ★ 1.2.7：hex 采样（只读）—— 用来区分「按键帧 / 握手回复帧 / 收尾帧」
+    {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:ch.value.length * 3];
+        const uint8_t *bp = (const uint8_t *)ch.value.bytes;
+        for (NSUInteger i = 0; i < ch.value.length && i < 48; i++) [hex appendFormat:@"%02X ", bp[i]];
+        SPLog(@"car", @"   车帧 hex=%@", hex);
+    }
+    // ★ 1.2.7：空闲期（step==0）车主动发帧 = 实体开关被按下 → 立刻发一轮。
+    //   真机铁证：07:30:08 / 07:31:18 用户按开关时车主动推帧，而当时我们什么都没发。
+    //   4 秒闸门用来排除「我们发完四帧后车在 +1 秒补发的那条收尾帧」。
+    {
+        NSTimeInterval cnow = SPNow();
+        NSTimeInterval gap = (_lastCarAt > 0) ? (cnow - _lastCarAt) : 1e9;
+        _lastCarAt = cnow;
+        if (_step == 0 && gap > 4.0) {
+            SPLog(@"direct", @"★ 车主动发帧（空闲 %.1f 秒）—— 判定为开关按下，立即发帧", gap);
+            _forceSend = YES;
+            [self directBegin];
+            _forceSend = NO;
+            return;                     // 按键帧不参与握手解析
+        }
+    }
     [self onCarFrame:ch.value];
 }
 
