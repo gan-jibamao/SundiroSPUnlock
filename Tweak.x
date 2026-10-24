@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.4"
+#define SPVER        @"1.2.6"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -404,6 +404,11 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 @property (nonatomic, assign) NSInteger         stallRetries; // ★ A1：本链路自愈重发次数
 @property (nonatomic, assign) BOOL              saw42;        // ★ 1.2.4：本轮是否见过 42 帧（车端受理凭证）
 @property (nonatomic, assign) NSTimeInterval    no42At;       // ★ 1.2.4：上次因未见42主动换链时刻（60秒节流）
+@property (nonatomic, assign) NSTimeInterval    doneAt;       // ★ 1.2.6：本链路完成时刻（时效窗锚点）
+@property (nonatomic, assign) NSInteger         redoOnLink;   // ★ 1.2.6：本链路补发轮数（上限 2）
+@property (nonatomic, assign) NSTimeInterval    dirLogAt;     // ★ 1.2.6：directBegin 早退日志限流
+@property (nonatomic, assign) BOOL              fullDiscovery;// ★ 1.2.6：是否已退回全量 GATT 发现
+@property (nonatomic, assign) BOOL              fff0CharsDone; // ★ 1.2.6：本链路 FFF0 的特征是否已回
 @end
 
 static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动，需前向声明
@@ -563,12 +568,42 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
 
 - (void)directBegin {
     @try {
+        NSTimeInterval t0 = SPNow();                   // ★ 1.2.6：早退日志用（此时 now 尚未声明）
         if (!SPFlag(@"unlock", YES)) return;
-        if (_step != 0) return;
-        if (!_wr || _car.state != CBPeripheralStateConnected) return;
+        if (_step != 0) {
+            if (t0 - _dirLogAt > 5.0) {
+                _dirLogAt = t0;
+                SPLog(@"direct", @"直发被「本轮进行中」挡住（step=%ld）", (long)_step);
+            }
+            return;
+        }
+        if (!_wr || _car.state != CBPeripheralStateConnected) {
+            if (t0 - _dirLogAt > 5.0) {
+                _dirLogAt = t0;
+                SPLog(@"direct", @"直发被「链路未就绪」挡住（写特征=%@ 状态=%ld）",
+                      _wr ? @"有" : @"无", (long)_car.state);
+            }
+            return;
+        }
         NSTimeInterval now = SPNow();                  // ★ C3：单调时钟
-        // 同一条链路已完整发过一轮 → 不再重复（车早就解开了）
-        if (_doneLink > 0 && _linkAt > 0 && fabs(_doneLink - _linkAt) < 0.001) return;
+        // 同一条链路已完整发过一轮 → 时效窗内不重复（车早就解开了）
+        // ★ 1.2.6：原实现是「本链路永久封死」，实测封死中位 126 秒、最长 20.7 分钟，
+        //   78% 的轮次封死超过 30 秒 —— 这期间用户按实体开关，插件零动作零日志。
+        //   改为 12 秒时效窗 + 同链路最多补发 2 次。
+        if (_doneLink > 0 && _linkAt > 0 && fabs(_doneLink - _linkAt) < 0.001) {
+            NSTimeInterval age = (_doneAt > 0) ? (now - _doneAt) : 1e9;
+            if (age < 12.0 || _redoOnLink >= 2) {
+                if (now - _dirLogAt > 5.0) {
+                    _dirLogAt = now;
+                    SPLog(@"direct", @"直发被「本链路已完成」挡住（完成于 %.1f 秒前，补发 %ld/2）",
+                          age, (long)_redoOnLink);
+                }
+                return;
+            }
+            _redoOnLink++;
+            SPLog(@"direct", @"本链路已完成 %.0f 秒 —— 允许补发（第 %ld 次）",
+                  age, (long)_redoOnLink);
+        }
         // 冷却 20 秒：只作**同链路**防抖兜底。链路一断 _lastAt 即归零（见 didDisconnectPeripheral），
         // 所以新链路永远不会被上一轮的冷却挡住。本条排在 _doneLink 守卫之后，不会在
         // 「本轮已发完」的 15 秒轮询里刷屏。
@@ -656,6 +691,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
             //   车早已解开却每 ~30 秒（SPTick 15s × 20s 冷却）重发一轮四帧。
             //   断开时 didDisconnectPeripheral 会把它清 0，下次靠近照样解锁。
             _doneLink = _linkAt;
+            _doneAt   = SPNow();                       // ★ 1.2.6：时效窗起点
             _stallRetries = 0;                         // ★ A1：本轮链路自愈计数归零
             SPLog(@"direct", @"★ 四帧发完（42 已确认）—— 耗时 %.0f ms（累计成功 %ld 次）",
                   (SPNow() - _startAt) * 1000.0, (long)_unlocks);   // ★ C3
@@ -701,6 +737,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         }
         _connecting = NO; _stallRetries = 0; _round++; _saw42 = NO;
         _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _lastAt = 0;
+        _doneAt = 0; _redoOnLink = 0; _fullDiscovery = NO; _fff0CharsDone = NO;   // ★ 1.2.6：时效窗与发现模式一并复位
     }
 }
 
@@ -751,10 +788,41 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
                          //   封顶 30 秒后即便连成功几十次也永远 30 秒才重连。
                          //   官方 App 的 _backoff 是实例变量并在 7 处主动重置。
     _wr = nil; _nt = nil; _step = 0;
+    _redoOnLink = 0; _fff0CharsDone = NO;   // ★ 1.2.6：新链路 —— 补发计数复位；_fullDiscovery 跨链路保留
     SPLog(@"link", @"✅ 已连接 %@ (累计 %ld 次)", p.name ?: @"(无名)", (long)_connects);
     p.delegate = self;
     [self stopScan:@"已连接"];
-    [p discoverServices:nil];
+    // ★ 1.2.6：只发现 FFF0（FFF1/FFF6 所在服务）。原来 discoverServices:nil 会把车上
+    //   6 个服务逐个 discoverCharacteristics，= 6 次 BLE 往返；实测「连接→写特征就绪」
+    //   中位 3.0 秒、p90 5.0 秒。精简后 2 次往返，典型省约 2 秒。
+    //   兜底：1.2 秒内没拿到 FFF6 → 退回全量发现（防 FFF6 不在 FFF0 的车型）。
+    [p discoverServices:(_fullDiscovery ? nil : @[ [CBUUID UUIDWithString:@"FFF0"] ])];
+    if (!_fullDiscovery) {
+        NSUInteger gen0 = _round;
+        // 兜底第一段（1.2 秒）：FFF0 的特征已经回来、但里面没有 FFF6 ⇒ FFF6 在别的服务里。
+        //   只有在「FFF0 特征确已回包」时才触发，避免特征发现稍慢就重复发起全量发现。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       SPQueue(), ^{
+            if (self->_round != gen0) return;
+            if (self->_wr) return;
+            if (self->_car.state != CBPeripheralStateConnected) return;
+            if (!self->_fff0CharsDone) return;      // FFF0 还没回，交给第二段
+            SPLog(@"gatt", @"★ FFF0 特征里没有 FFF6 —— 退回全量发现");
+            self->_fullDiscovery = YES;             // 记住：本机车型以后都走全量
+            [self->_car discoverServices:nil];
+        });
+        // 兜底第二段（2.5 秒）：连 FFF0 服务本身都没回来（发现异常）⇒ 全量重来一次
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       SPQueue(), ^{
+            if (self->_round != gen0) return;
+            if (self->_wr) return;
+            if (self->_car.state != CBPeripheralStateConnected) return;
+            if (self->_fff0CharsDone) return;       // 已回过，交给第一段判定
+            SPLog(@"gatt", @"★ FFF0 服务发现 2.5 秒未回 —— 退回全量发现");
+            self->_fullDiscovery = YES;
+            [self->_car discoverServices:nil];
+        });
+    }
 }
 
 - (void)centralManager:(CBCentralManager *)cm
@@ -766,7 +834,9 @@ didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 
 - (void)centralManager:(CBCentralManager *)cm
 didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
+    BOOL gattReady = (_wr != nil);                      // ★ 1.2.6：必须在清 _wr 之前取
     _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _saw42 = NO;
+    _doneAt = 0; _redoOnLink = 0;                       // ★ 1.2.6：新链路，时效窗与补发计数作废
     // ★ 1.2.1：冷却锚点也必须随链路作废。1.2.0 在这里清了一堆状态却漏了 _lastAt，
     //   导致「发到一半链路被断 → 立刻重连 → 新链路就绪」时，directBegin 被上一条链路的
     //   20 秒冷却在第 545 行静默 return（零日志），只能等 SPTick 下一拍补发。
@@ -776,14 +846,17 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
     _lastAt = 0;                                        // ★ 1.2.1：清冷却，新链路不受上一轮影响
     _connecting = NO; _stallRetries = 0; _round++;      // ★ B2/A1：链路已断，守卫与看门狗全作废
     SPLog(@"link", @"⚠️ 断开：%@", e ? e.localizedDescription : @"主动/正常断开");
+    // ★ 1.2.6：GATT 未就绪就断 = 车刚醒 / 闪断（实测占全部链路的 20.8%）。
+    //   等 1 秒再连会错过车的唤醒窗口，改为 0.3 秒抢连。
+    if (!gattReady) _backoff = 0.3;
     [self retryLater:@"断开"];
 }
 
 - (void)retryLater:(NSString *)why {
     // ★ A3：原来这里是 static 局部变量 —— 只增不减、全工程无重置点，封顶后永远 30 秒。
     //   改实例变量 _backoff，并在 didConnectPeripheral 里复位为 1.0。
-    NSTimeInterval d = MIN(_backoff, 30.0);
-    _backoff = MIN(_backoff * 2.0, 30.0);
+    NSTimeInterval d = MIN(_backoff, 4.0);       // ★ 1.2.6：封顶 30s → 4s
+    _backoff = MIN(_backoff * 2.0, 4.0);
     SPLog(@"link", @"%@ → %.0f 秒后重试", why, d);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                    SPQueue(), ^{                                   // ★ B1
@@ -795,7 +868,15 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 - (void)peripheral:(CBPeripheral *)p didDiscoverServices:(NSError *)e {
     for (CBService *s in p.services) {
         SPLog(@"gatt", @"服务 %@", s.UUID.UUIDString);
-        [p discoverCharacteristics:nil forService:s];
+        if ([s.UUID.UUIDString caseInsensitiveCompare:@"FFF0"] == NSOrderedSame) {
+            // ★ 1.2.6：只问 FFF1/FFF6，省掉同服务内其它特征的往返
+            [p discoverCharacteristics:@[ [CBUUID UUIDWithString:@"FFF1"],
+                                          [CBUUID UUIDWithString:@"FFF6"] ]
+                            forService:s];
+        } else if (_fullDiscovery) {
+            // ★ 1.2.6：只有兜底模式下才逐个发现其它服务（正常路径省 5 次往返 ≈ 2 秒）
+            [p discoverCharacteristics:nil forService:s];
+        }
     }
 }
 
@@ -807,6 +888,7 @@ didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
         if ([c.UUID.UUIDString caseInsensitiveCompare:@"FFF6"] == NSOrderedSame) _wr = c;
         if ([c.UUID.UUIDString caseInsensitiveCompare:@"FFF1"] == NSOrderedSame) _nt = c;
     }
+    if ([svc.UUID.UUIDString caseInsensitiveCompare:@"FFF0"] == NSOrderedSame) _fff0CharsDone = YES;   // ★ 1.2.6
     if (_wr && _nt && !_nt.isNotifying) {
         [p setNotifyValue:YES forCharacteristic:_nt];
         SPLog(@"gatt", @"订阅 FFF1（车的回帧从这条来）");
