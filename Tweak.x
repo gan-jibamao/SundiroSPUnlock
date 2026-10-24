@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.7"
+#define SPVER        @"1.2.8"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -377,6 +377,16 @@ static NSData *SPFrame(unsigned char cmd, unsigned char seq, unsigned char statu
 }
 
 //════════════════════════════ 解锁器 ════════════════════════════
+// ★ 1.2.8：车端固定帧（真机两次按下逐字节相同）
+//   按键帧   = 实体开关被按下（空闲期主动推送，26 字节）
+//   状态帧   = 我们解锁成功后车补发的状态通知（26 字节，头 7 字节与按键帧完全相同，只有载荷不同）
+static const unsigned char kPressFrame[26] = {
+    0x55,0x55,0x1A,0x02,0x00,0x01,0x05,0xE1,0xAD,0x87,0x13,0xBF,0x87,0x78,0xF9,0xB7,
+    0x01,0xAC,0x4A,0xFE,0xFB,0x04,0x86,0xAA,0xAA,0xAA };
+static const unsigned char kStatusFrame[26] = {
+    0x55,0x55,0x1A,0x02,0x00,0x01,0x05,0xF7,0xEA,0xB8,0x13,0x52,0xBA,0x60,0x19,0xFF,
+    0x82,0xC3,0x77,0x6C,0xAB,0x56,0xD3,0xB0,0xAA,0xAA };
+
 @interface SPUnlocker : NSObject <CBCentralManagerDelegate, CBPeripheralDelegate>
 @property (nonatomic, strong) CBCentralManager *cm;
 @property (nonatomic, strong) CBPeripheral     *car;
@@ -593,18 +603,22 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         //   78% 的轮次封死超过 30 秒 —— 这期间用户按实体开关，插件零动作零日志。
         // ★ 1.2.7：改为「按键帧触发」—— 空闲期车主动发帧才发，定时器仅留 90 秒兜底 1 次。
         // ★ 1.2.7：本链路已完成后 —— 只认「车主动发帧（实体开关）」触发；
-        //   定时器不再补发（1.2.6 实测 30 秒内自发 2 轮，纯属白烧），仅保留 90 秒兜底 1 次。
+        //   定时器不再补发（1.2.6 实测 30 秒内自发 2 轮，纯属白烧）。
+        // ★ 1.2.8：链路现在能活 10+ 分钟（实测 07:42:19→07:52:16），原来「每链路只兜底 1 次」
+        //   一用掉就永久哑火。改为每 90 秒可兜底 1 次、每条链路最多 3 次，收到任何车帧即复位。
         if (_doneLink > 0 && _linkAt > 0 && fabs(_doneLink - _linkAt) < 0.001 && !_forceSend) {
             NSTimeInterval age = (_doneAt > 0) ? (now - _doneAt) : 1e9;
-            if (age < 90.0 || _redoOnLink >= 1) {
-                if (now - _dirLogAt > 5.0) {
+            if (age < 90.0 || _redoOnLink >= 3) {
+                if (now - _dirLogAt > 60.0) {      // ★ 1.2.8：降噪 5 秒 → 60 秒
                     _dirLogAt = now;
-                    SPLog(@"direct", @"直发被「本链路已完成」挡住（完成于 %.0f 秒前，等车帧触发）", age);
+                    SPLog(@"direct", @"直发被「本链路已完成」挡住（完成于 %.0f 秒前，等车帧触发，兜底 %ld/3）",
+                          age, (long)_redoOnLink);
                 }
                 return;
             }
             _redoOnLink++;
-            SPLog(@"direct", @"★ 90 秒无按键帧 —— 兜底补发 1 次");
+            _doneAt = now;                          // 重置 90 秒窗口，下次兜底再等 90 秒
+            SPLog(@"direct", @"★ 90 秒无车帧 —— 兜底补发（第 %ld/3 次）", (long)_redoOnLink);
         }
         // 冷却 20 秒：只作**同链路**防抖兜底。链路一断 _lastAt 即归零（见 didDisconnectPeripheral），
         // 所以新链路永远不会被上一轮的冷却挡住。本条排在 _doneLink 守卫之后，不会在
@@ -639,6 +653,16 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     @try {
         if (_step == 0) return;
         NSUInteger L = d.length;
+        // ★ 1.2.8：握手期屏蔽非握手帧 —— 按键帧/状态帧与 step-1 回复同为 26 字节，
+        //   且头 7 字节完全相同（只有第 8 字节 01 vs 05 不同）。握手途中按开关会被当成
+        //   step-1 回复吞掉 → 串帧 → 本轮报废。这里只屏蔽两条**已知固定帧**，其余帧型行为不变。
+        if (L == 26) {
+            const uint8_t *hb = (const uint8_t *)d.bytes;
+            if (memcmp(hb, kPressFrame, 26) == 0 || memcmp(hb, kStatusFrame, 26) == 0) {
+                SPLog(@"direct", @"握手进行中收到按键/状态帧 —— 忽略（step=%ld）", (long)_step);
+                return;
+            }
+        }
         if (L == 42) _saw42 = YES;   // ★ 1.2.4：车端受理凭证 —— 整轮见过 42 才视为会话被接受
         if (_step == 1 && (L == 26 || L == 42)) {
             _step = 2;
@@ -923,19 +947,35 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
         for (NSUInteger i = 0; i < ch.value.length && i < 48; i++) [hex appendFormat:@"%02X ", bp[i]];
         SPLog(@"car", @"   车帧 hex=%@", hex);
     }
-    // ★ 1.2.7：空闲期（step==0）车主动发帧 = 实体开关被按下 → 立刻发一轮。
-    //   真机铁证：07:30:08 / 07:31:18 用户按开关时车主动推帧，而当时我们什么都没发。
-    //   4 秒闸门用来排除「我们发完四帧后车在 +1 秒补发的那条收尾帧」。
+    // ★ 1.2.8：按键帧 / 解锁后状态帧的字节是**固定**的（真机两次按下逐字节相同），
+    //   直接按字节认，比 4 秒时间闸门可靠 —— 状态帧迟到多久都不会被误判成按键。
+    //   未知帧型仍走时间闸门兜底，不丢新车型。
     {
         NSTimeInterval cnow = SPNow();
         NSTimeInterval gap = (_lastCarAt > 0) ? (cnow - _lastCarAt) : 1e9;
         _lastCarAt = cnow;
-        if (_step == 0 && gap > 4.0) {
-            SPLog(@"direct", @"★ 车主动发帧（空闲 %.1f 秒）—— 判定为开关按下，立即发帧", gap);
-            _forceSend = YES;
-            [self directBegin];
-            _forceSend = NO;
-            return;                     // 按键帧不参与握手解析
+        if (_step == 0 && ch.value.length == 26) {
+            const uint8_t *b = (const uint8_t *)ch.value.bytes;
+            BOOL isPress  = (memcmp(b, kPressFrame, 26) == 0);
+            BOOL isStatus = (memcmp(b, kStatusFrame, 26) == 0);
+            if (isStatus) {
+                SPLog(@"direct", @"解锁后状态帧 —— 忽略（空闲 %.1f 秒）", gap);
+                return;                 // 永不当按键
+            }
+            if (isPress || gap > 4.0) {
+                SPLog(@"direct", @"★ 车主动发帧（%@，空闲 %.1f 秒）—— 判定为开关按下，立即发帧",
+                      isPress ? @"字节直认" : @"时间闸门", gap);
+                _redoOnLink = 0;        // ★ 1.2.8：真实按键 → 兜底额度复位
+                if (!isPress) {
+                    NSMutableString *u = [NSMutableString string];
+                    for (NSUInteger i = 0; i < 26; i++) [u appendFormat:@"%02X ", b[i]];
+                    SPLog(@"direct", @"   未知帧型（待归类）hex=%@", u);
+                }
+                _forceSend = YES;
+                [self directBegin];
+                _forceSend = NO;
+                return;                 // 按键帧不参与握手解析
+            }
         }
     }
     [self onCarFrame:ch.value];
