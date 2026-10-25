@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.9"
+#define SPVER        @"1.2.10"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -421,7 +421,7 @@ static const unsigned char kStatusFrame[26] = {
 @property (nonatomic, assign) BOOL              fff0CharsDone; // ★ 1.2.6：本链路 FFF0 的特征是否已回
 @property (nonatomic, assign) NSTimeInterval    lastCarAt;     // ★ 1.2.7：上一条车帧时刻（判按键间隔）
 @property (nonatomic, assign) BOOL              forceSend;     // ★ 1.2.7：按键触发，绕过完成门禁与冷却
-@property (nonatomic, assign) BOOL              sawPressOnLink; // ★ 1.2.9：本链路见过按键帧 ⇒ 定时兜底永久关闭
+@property (nonatomic, assign) BOOL              carSendsPress;   // ★ 1.2.10：本车会主动发按键帧（跨链路记忆，重连不重置）
 @property (nonatomic, assign) BOOL              stuckCancel;    // ★ 1.2.9：主动取消卡死连接（防重复排程重连）
 @end
 
@@ -527,13 +527,30 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         //   本条早退仍是零控制流改动：只决定「打不打日志」，不影响任何行为。
         NSTimeInterval gnow = SPNow();
         NSTimeInterval held = _connAt > 0 ? gnow - _connAt : -1.0;
-        // ★ 1.2.9：挂起超过 8 秒就主动取消重来。
-        //   原来两个分支都只打日志、从不取消，_connecting 恒为 YES，tryConnect 每次都被弹回。
-        //   真机铁证（1.2.8）：08:10:46 发起 → 08:11:49 才连上，整整 63 秒；
-        //   这 63 秒里 _wr 还是 nil，用户按开关 = 零反应（「按几下才有反应」的残留入口）。
-        if (held > 8.0 && _car.state != CBPeripheralStateConnected) {
-            SPLog(@"link", @"★ 连接挂起 %.0f 秒未落地 —— 主动取消并重试（状态=%ld）",
-                  held, (long)_car.state);
+        // ★ 1.2.10：撤销 1.2.9 的「挂起 8 秒就取消」—— 那是误诊。
+        //   1.2.9 真机 6h45m 实测：取消 1684 次，**全部** 外设状态=1（Connecting）。
+        //   状态=1 = iOS 仍持有 pending connect，车一广播就自动连上 —— 最省电也最快。
+        //   1.2.8 那 63 秒不是 bug，是车在睡觉，pending connect 一直在等，车醒就自己连上了。
+        //   每 8 秒取消重发 = 把「安静等车出现」换成「每 9 秒重排一次队」：
+        //     ① 6h45m 内 1684 次无谓重连（≈250 次/小时），耗电；
+        //     ② [link] 日志占 91%，524 KB/6.75h，轮转极快会挤掉真证据；
+        //     ③ 每次取消后有 1 秒空窗，车的广播窗口落进去就要多等一轮。
+        //   上面 1.2.3 的注释早就写明「状态=1 健康」，1.2.9 自相矛盾。
+        if (_car.state == CBPeripheralStateDisconnected) {
+            // 真异常：iOS 把我们的请求丢了（蓝牙重启 / 系统回收），守卫却还挂着 → 立刻重发
+            if (gnow - _guardLogAt > 60.0) {
+                _guardLogAt = gnow;
+                SPLog(@"link", @"连接请求已丢失（状态=0 但守卫挂 %.0f 秒）—— 重发", held);
+            }
+            _connecting = NO;
+            _connAt = 0;
+            _backoff = 1.0;
+            [self tryConnect];
+            return;
+        }
+        if (held > 180.0 && _car.state != CBPeripheralStateConnecting) {
+            // 长兜底：挂了 3 分钟且状态既非 Connecting 也非 Disconnected → 确实卡死
+            SPLog(@"link", @"★ 连接卡死 %.0f 秒（状态=%ld）—— 取消重来", held, (long)_car.state);
             _connecting = NO;
             _connAt = 0;
             _backoff = 1.0;
@@ -543,7 +560,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
                            SPQueue(), ^{ [self tryConnect]; });
             return;
         }
-        if (gnow - _guardLogAt > 600.0) {       // 8 秒内的健康挂起：10 分钟一条，中性措辞
+        if (gnow - _guardLogAt > 600.0) {       // 健康挂起（状态=1）：10 分钟一条，中性措辞
             _guardLogAt = gnow;
             SPLog(@"link", @"连接请求仍在挂起（已挂 %.0f 秒，外设状态=%ld）",
                   held, (long)_car.state);
@@ -555,10 +572,10 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     _connAt = SPNow();                                        // ★ 1.2.2：记下发时刻
     SPLog(@"link", @"连接请求 -> %@", _carName ?: _carUUID ?: @"(未知)");
     [_cm connectPeripheral:_car options:nil];
-    // ★ 1.2.9：独立超时检查 —— SPTick 是 15 秒周期，只靠它超时最坏要 23 秒。
-    //   这里 8 秒后主动回看一眼，走进 tryConnect 的「挂起 > 8 秒」分支执行取消重来。
+    // ★ 1.2.10：删除 1.2.9 的「独立 8 秒超时检查」—— 不再需要。
+    //   撤销后 pending connect 一直挂着，车广播即连；SPTick 每 15 秒一拍足够处理真卡死。
     NSUInteger gen = _round;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
                    SPQueue(), ^{
         if (self->_round != gen) return;        // 链路代际已变，忽略
         if (!self->_connecting) return;         // 已连上 / 已被处理
@@ -568,8 +585,14 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
 
 - (void)adopt:(CBPeripheral *)p why:(NSString *)why {
     if (!p.identifier) return;
+    NSString *newUUID = p.identifier.UUIDString;
+    // ★ 1.2.10：只有「换车」才清「本车会发按键帧」的记忆；同一台车反复 adopt 不能清
+    if (_carUUID.length && newUUID.length && ![_carUUID isEqualToString:newUUID]) {
+        _carSendsPress = NO;
+        SPLog(@"link", @"换车 %@ → %@ —— 重置按键帧记忆", _carUUID, newUUID);
+    }
     _car = p;
-    _carUUID = p.identifier.UUIDString;
+    _carUUID = newUUID;
     if (p.name.length) _carName = p.name;
     p.delegate = self;
     [[[NSUserDefaults alloc] initWithSuiteName:kPrefsSuite] setObject:_carUUID forKey:@"vehicle"];
@@ -632,7 +655,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
             // ★ 1.2.9：本链路一旦见过按键帧（字节直认），说明该车会主动推送按键信号，
             //   定时兜底就只剩「没人按也解锁」这一个副作用 —— 永久关闭。
             //   真机铁证（1.2.8，08:03→08:16）：13 分钟 10 轮解锁，其中 4 轮用户明确没按。
-            if (age < 90.0 || _redoOnLink >= 3 || _sawPressOnLink) {
+            if (age < 90.0 || _redoOnLink >= 3 || _carSendsPress) {
                 if (now - _dirLogAt > 60.0) {      // ★ 1.2.8：降噪 5 秒 → 60 秒
                     _dirLogAt = now;
                     SPLog(@"direct", @"直发被「本链路已完成」挡住（完成于 %.0f 秒前，等车帧触发，兜底 %ld/3）",
@@ -788,6 +811,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         _connecting = NO; _stallRetries = 0; _round++; _saw42 = NO;
         _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _lastAt = 0;
         _doneAt = 0; _redoOnLink = 0; _fullDiscovery = NO; _fff0CharsDone = NO;   // ★ 1.2.6：时效窗与发现模式一并复位
+        _carSendsPress = NO;    // ★ 1.2.10：蓝牙重开 → 重新观察本车是否发按键帧
     }
 }
 
@@ -839,7 +863,9 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
                          //   官方 App 的 _backoff 是实例变量并在 7 处主动重置。
     _wr = nil; _nt = nil; _step = 0;
     _redoOnLink = 0; _fff0CharsDone = NO;   // ★ 1.2.6：新链路 —— 补发计数复位；_fullDiscovery 跨链路保留
-    _sawPressOnLink = NO;                   // ★ 1.2.9：新链路重新观察该车是否发按键帧
+    // ★ 1.2.10：_carSendsPress 不在此重置 —— 车的发帧能力与链路无关。
+    //   1.2.9 按链路记忆，实测 6 次自发解锁全部落在重连后的新链路上
+    //   （14:53:54 / 14:56:12 / 14:57:43 / 14:59:15 / 16:27:49 / 16:33:45）。
     SPLog(@"link", @"✅ 已连接 %@ (累计 %ld 次)", p.name ?: @"(无名)", (long)_connects);
     p.delegate = self;
     [self stopScan:@"已连接"];
@@ -863,13 +889,13 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
             [self->_car discoverServices:nil];
         });
         // 兜底第二段（2.5 秒）：连 FFF0 服务本身都没回来（发现异常）⇒ 全量重来一次
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
                        SPQueue(), ^{
             if (self->_round != gen0) return;
             if (self->_wr) return;
             if (self->_car.state != CBPeripheralStateConnected) return;
             if (self->_fff0CharsDone) return;       // 已回过，交给第一段判定
-            SPLog(@"gatt", @"★ FFF0 服务发现 2.5 秒未回 —— 退回全量发现");
+            SPLog(@"gatt", @"★ FFF0 服务发现 3.5 秒未回 —— 退回全量发现");
             self->_fullDiscovery = YES;
             [self->_car discoverServices:nil];
         });
@@ -1003,7 +1029,7 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
                 SPLog(@"direct", @"★ 车主动发帧（%@，空闲 %.1f 秒）—— 判定为开关按下，立即发帧",
                       isPress ? @"字节直认" : @"时间闸门", gap);
                 _redoOnLink = 0;        // ★ 1.2.8：真实按键 → 兜底额度复位
-                _sawPressOnLink = YES;  // ★ 1.2.9：该车会发按键帧 → 本链路兜底永久关闭
+                _carSendsPress = YES;    // ★ 1.2.10：全局记忆 —— 重连不重置，本车永久关闭定时兜底
                 if (!isPress) {
                     NSMutableString *u = [NSMutableString string];
                     for (NSUInteger i = 0; i < 26; i++) [u appendFormat:@"%02X ", b[i]];
