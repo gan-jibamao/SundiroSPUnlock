@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.14"
+#define SPVER        @"1.2.15"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -424,6 +424,10 @@ static const unsigned char kStatusFrame[26] = {
                                                             //   10:35:05 那条链路直接全量发现 6 个服务，
                                                             //   「连接→写特征就绪」由 1 秒涨到 5 秒，且永久生效。
 @property (nonatomic, assign) BOOL              carFromApp;    // ★ 1.2.14：车 UUID 来自官方 App plist（权威，不许被名字匹配覆盖）
+@property (nonatomic, assign) NSInteger          lastRSSI;      // ★ 1.2.15：最近一次看到车的信号强度
+@property (nonatomic, assign) NSTimeInterval     lastSeenAt;    // ★ 1.2.15：最近一次看到车的时刻
+@property (nonatomic, assign) NSTimeInterval     lastConnAt;    // ★ 1.2.15：最近一次真正连上的时刻（弱信号兜底用）
+@property (nonatomic, assign) NSTimeInterval     rssiLogAt;     // ★ 1.2.15：RSSI 日志限流
 @property (nonatomic, assign) BOOL              pressQueued;   // ★ 1.2.13：握手期收到按键帧，本轮结束后补发
 @property (nonatomic, assign) NSTimeInterval    lastOkAt;      // ★ 1.2.12：上次成功解锁时刻
                                                             //   连上就解冷却门禁的锚点（600 秒）。
@@ -472,17 +476,20 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
 }
 
 //──────────────────────── 扫描 / 连接 ────────────────────────
+// ★ 1.2.15：连接门限。RSSI ≥ -80 dBm 大致相当于「十米以内」。
+//   1.2.14 真机三次「车出现」全是 -95 / -98 / -99，连上后解锁中位 2275 ms。
+static const NSInteger kRSSIConnect = -80;
+
 - (void)beginScan:(NSString *)why {
     if (!_cm || _cm.state != CBManagerStatePoweredOn || _scanning) return;
     // ★ 1.2.14：断链期间**持续扫描**，不再「25 秒窗口 + 60 秒冷却」。
-    //   1.2.13 真机：19:39:24 断开 → 19:39:25 车就出现，说明车会**短促广播**；
-    //   旧占空比 25/85 ≈ 29%，即 71% 的时间我们是瞎的，根本无法区分
-    //   「车没广播」和「我们没听到」。
-    //   停止扫描统一交给 didConnectPeripheral「已连接」。
-    NSDictionary *o = @{ CBCentralManagerScanOptionAllowDuplicatesKey: @NO };
+    // ★ 1.2.15：AllowDuplicates 必须为 YES —— 原来为 NO，iOS 在每个扫描会话里
+    //   对每台设备**只回调一次**，RSSI 永远拿不到更新（1.2.14 真机 95 分钟「车出现」
+    //   只有 3 次，正是这个原因）。没有连续 RSSI 就无法做靠近判定。
+    NSDictionary *o = @{ CBCentralManagerScanOptionAllowDuplicatesKey: @YES };
     [_cm scanForPeripheralsWithServices:nil options:o];
     _scanning = YES;
-    SPLog(@"link", @"开始扫描（全设备，%@）", why);
+    SPLog(@"link", @"开始扫描（全设备、含重复回调，%@）", why);
 }
 
 - (void)stopScan:(NSString *)why {
@@ -605,6 +612,23 @@ static NSDictionary *SPConnectOptions(void) {
         return;
     }
     if (_car.state == CBPeripheralStateConnected || _car.state == CBPeripheralStateConnecting) return;
+    // ★ 1.2.15：未靠近就不主动连（RSSI 门禁）。
+    //   连接请求交给 didDiscoverPeripheral 命中「RSSI ≥ 门槛」时触发（forceReconnect）。
+    //   这样人在屋里（-95）不会连、不会解锁、不耗电；走近到 -80 以內才连。
+    //   兜底：连续 900 秒没连上，而最近 120 秒看到过车（任意信号），仍连一次。
+    NSTimeInterval nnow = SPNow();
+    BOOL near   = (_lastRSSI >= kRSSIConnect);
+    BOOL rescue = (_lastRSSI != 0 &&
+                   (_lastConnAt <= 0 || nnow - _lastConnAt > 900.0) &&
+                   (_lastSeenAt > 0 && nnow - _lastSeenAt < 120.0));
+    if (!near && !rescue) {
+        if (nnow - _rssiLogAt > 30.0) {
+            _rssiLogAt = nnow;
+            SPLog(@"link", @"未靠近（最近 RSSI=%ld < %d）—— 暂不下发连接，持续扫描等待",
+                  (long)_lastRSSI, kRSSIConnect);
+        }
+        return;
+    }
     _connecting = YES;
     _connAt = SPNow();                                        // ★ 1.2.2：记下发时刻
     SPLog(@"link", @"连接请求 -> %@", _carName ?: _carUUID ?: @"(未知)");
@@ -897,43 +921,62 @@ static NSDictionary *SPConnectOptions(void) {
      advertisementData:(NSDictionary<NSString *, id> *)adv
                   RSSI:(NSNumber *)RSSI {
     @try {
-        // ① UUID 命中（App 学到的）
-        if (p.identifier.UUIDString && _carUUID.length &&
-            [_carUUID caseInsensitiveCompare:p.identifier.UUIDString] == NSOrderedSame) {
-            SPLog(@"link", @"★ 车出现 %@ RSSI=%@ — UUID 命中", p.name ?: @"(无名)", RSSI);
-            // ★ 1.2.13：不再「一看到就停扫」—— 扫到不等于连上，连接失败时停扫会让我们
-            //   在冷却期内再也看不到车。停扫改由 didConnectPeripheral「已连接」负责。
-            [self adopt:p why:@"UUID 命中"]; [self forceReconnect:@"UUID 命中"];
-            return;
-        }
+        if (p.state == CBPeripheralStateConnected) return;
+        BOOL isMine = (p.identifier.UUIDString && _carUUID.length &&
+                       [_carUUID caseInsensitiveCompare:p.identifier.UUIDString] == NSOrderedSame);
         // ② 名字前缀命中（车名实测 SDH-xxxxxx）
         // ★ 1.2.14：已知车名后必须**完全同名**才认。
         //   「SDH-」只是品牌前缀，不是唯一标识 —— 现场同时有两台 SDH- 车
         //   （SDH-49D6FD / SDH-4B834A）。1.2.13 把扫描改成常驻后立刻爆雷：
         //   真机 19:39:25 UUID 命中你的车，同一秒名字命中了 SDH-4B834A，
-        //   _car 被抢走并重置按键帧记忆，随后 4 帧全发给了别人的车，
-        //   你的车那几轮一次都没解开（全程「换车」4 次、连错车 3 次）。
-        //   UUID 未知时才允许用前缀兜底（首次认车）。
+        //   _car 被抢走并重置按键帧记忆，随后 4 帧全发给了别人的车。
         NSString *nm = p.name;
-        BOOL nameMatch = (nm.length && strlen(kNamePrefix) && [nm hasPrefix:@(kNamePrefix)]
-                          && (!_carName.length || [nm isEqualToString:_carName]));
-        if (nameMatch) {
-            SPLog(@"link", @"★ 车出现 %@ RSSI=%@ — 名字命中", nm, RSSI);
-            [self adopt:p why:@"名字命中"]; [self forceReconnect:@"名字命中"];
+        if (!isMine) {
+            BOOL nameMatch = (nm.length && strlen(kNamePrefix) && [nm hasPrefix:@(kNamePrefix)]
+                              && (!_carName.length || [nm isEqualToString:_carName]));
+            if (!nameMatch) {
+                // ③ 其余只在日志留痕（低频，别刷屏）
+                static NSTimeInterval lastLog = 0;
+                NSTimeInterval now0 = SPNow();
+                if (nm.length && now0 - lastLog > 20.0) {
+                    lastLog = now0;
+                    SPLog(@"link", @"旁侧设备 %@ RSSI=%@", nm, RSSI);
+                }
+                return;
+            }
+        }
+        // ★ 1.2.15：RSSI 门禁 —— 只有「真的靠近」才连。
+        //   1.2.14 真机：95 分钟里车只出现 3 次，RSSI 全是 -95 / -98 / -99（很远），
+        //   连上后每帧往返都慢，解锁中位退化到 2275 ms（1.2.11 好信号时是 1200 ms）。
+        //   而且每次连上都会解锁一轮 —— 人在 100 米外车就被解开，纯属浪费。
+        //   现在：RSSI ≥ -80 才发起连接；弱信号只记录、不连。
+        //   兜底：若已连续 900 秒没连上，而最近 120 秒看到过车（任意信号），
+        //   仍允许连一次，避免「信号一直偏弱 → 永久失联」。
+        NSTimeInterval now = SPNow();
+        _lastRSSI   = RSSI.integerValue;
+        _lastSeenAt = now;
+        BOOL near   = (_lastRSSI >= kRSSIConnect);
+        BOOL rescue = (!near && _lastRSSI != 0 &&
+                       (_lastConnAt <= 0 || now - _lastConnAt > 900.0));
+        if (!(near || rescue)) {
+            if (now - _rssiLogAt > 30.0) {
+                _rssiLogAt = now;
+                SPLog(@"link", @"车在远处 %@ RSSI=%ld < %d —— 暂不连接", nm ?: @"(无名)",
+                      (long)_lastRSSI, kRSSIConnect);
+            }
             return;
         }
-        // ③ 其余只在日志留痕（低频，别刷屏）
-        static NSTimeInterval lastLog = 0;
-        NSTimeInterval now = SPNow();                  // ★ C3：单调时钟
-        if (nm.length && now - lastLog > 20.0) {
-            lastLog = now;
-            SPLog(@"link", @"旁侧设备 %@ RSSI=%@", nm, RSSI);
-        }
+        SPLog(@"link", @"★ 车出现 %@ RSSI=%ld（门槛 %d%@）— %@",
+              nm ?: @"(无名)", (long)_lastRSSI, kRSSIConnect,
+              near ? @"" : @"，弱信号兜底", isMine ? @"UUID 命中" : @"名字命中");
+        [self adopt:p why:(isMine ? @"UUID 命中" : @"名字命中")];
+        [self forceReconnect:(isMine ? @"UUID 命中" : @"名字命中")];
     } @catch (NSException *e) { SPLog(@"link", @"didDiscover 异常: %@", e.reason); }
 }
 
 - (void)centralManager:(CBCentralManager *)cm didConnectPeripheral:(CBPeripheral *)p {
     _connects++;
+    _lastConnAt = SPNow();   // ★ 1.2.15：弱信号兜底计时的起点
     _connecting = NO;    // ★ B2：连接已落地，守卫复位
     _stallRetries = 0;   // ★ A1：新链路，自愈计数归零
     _saw42 = NO;         // ★ 1.2.4：新链路，42 凭证复位
