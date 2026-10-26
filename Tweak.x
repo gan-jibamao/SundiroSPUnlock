@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.10"
+#define SPVER        @"1.2.11"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -418,6 +418,11 @@ static const unsigned char kStatusFrame[26] = {
 @property (nonatomic, assign) NSInteger         redoOnLink;   // ★ 1.2.6：本链路补发轮数（上限 2）
 @property (nonatomic, assign) NSTimeInterval    dirLogAt;     // ★ 1.2.6：directBegin 早退日志限流
 @property (nonatomic, assign) BOOL              fullDiscovery;// ★ 1.2.6：是否已退回全量 GATT 发现
+@property (nonatomic, assign) BOOL              fullOnce;      // ★ 1.2.11：本条链路一次性全量（不改拓扑结论）
+                                                            //   1.2.10 真机铁证：10:34:54 因 FFF0 回包慢（5.0 秒）
+                                                            //   触发 3.5 秒兜底，却写死了 _fullDiscovery ⇒ 之后
+                                                            //   10:35:05 那条链路直接全量发现 6 个服务，
+                                                            //   「连接→写特征就绪」由 1 秒涨到 5 秒，且永久生效。
 @property (nonatomic, assign) BOOL              fff0CharsDone; // ★ 1.2.6：本链路 FFF0 的特征是否已回
 @property (nonatomic, assign) NSTimeInterval    lastCarAt;     // ★ 1.2.7：上一条车帧时刻（判按键间隔）
 @property (nonatomic, assign) BOOL              forceSend;     // ★ 1.2.7：按键触发，绕过完成门禁与冷却
@@ -656,7 +661,9 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
             //   定时兜底就只剩「没人按也解锁」这一个副作用 —— 永久关闭。
             //   真机铁证（1.2.8，08:03→08:16）：13 分钟 10 轮解锁，其中 4 轮用户明确没按。
             if (age < 90.0 || _redoOnLink >= 3 || _carSendsPress) {
-                if (now - _dirLogAt > 60.0) {      // ★ 1.2.8：降噪 5 秒 → 60 秒
+                if (now - _dirLogAt > 300.0) {     // ★ 1.2.11：60 秒 → 300 秒
+                                                   //   1.2.10 真机实测 10:37:27→10:52:37 空闲 15 分钟刷了 17 条，
+                                                   //   占本段 [direct] 日志 27%，会加速 512 KB 轮转挤掉真证据。
                     _dirLogAt = now;
                     SPLog(@"direct", @"直发被「本链路已完成」挡住（完成于 %.0f 秒前，等车帧触发，兜底 %ld/3）",
                           age, (long)_redoOnLink);
@@ -862,7 +869,10 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
                          //   封顶 30 秒后即便连成功几十次也永远 30 秒才重连。
                          //   官方 App 的 _backoff 是实例变量并在 7 处主动重置。
     _wr = nil; _nt = nil; _step = 0;
-    _redoOnLink = 0; _fff0CharsDone = NO;   // ★ 1.2.6：新链路 —— 补发计数复位；_fullDiscovery 跨链路保留
+    _redoOnLink = 0; _fff0CharsDone = NO; _fullOnce = NO;
+    // ★ 1.2.6：新链路 —— 补发计数复位；_fullDiscovery 跨链路保留
+    // ★ 1.2.11：_fullOnce（救急用的一次性全量）必须每条链路复位，
+    //   否则一次慢回包会把后面所有链路都拖进 5 秒全量发现（1.2.10 真机实测）。
     // ★ 1.2.10：_carSendsPress 不在此重置 —— 车的发帧能力与链路无关。
     //   1.2.9 按链路记忆，实测 6 次自发解锁全部落在重连后的新链路上
     //   （14:53:54 / 14:56:12 / 14:57:43 / 14:59:15 / 16:27:49 / 16:33:45）。
@@ -873,8 +883,9 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     //   6 个服务逐个 discoverCharacteristics，= 6 次 BLE 往返；实测「连接→写特征就绪」
     //   中位 3.0 秒、p90 5.0 秒。精简后 2 次往返，典型省约 2 秒。
     //   兜底：1.2 秒内没拿到 FFF6 → 退回全量发现（防 FFF6 不在 FFF0 的车型）。
-    [p discoverServices:(_fullDiscovery ? nil : @[ [CBUUID UUIDWithString:@"FFF0"] ])];
-    if (!_fullDiscovery) {
+    BOOL fullNow = (_fullDiscovery || _fullOnce);   // ★ 1.2.11：拓扑全量 或 本条链路救急全量
+    [p discoverServices:(fullNow ? nil : @[ [CBUUID UUIDWithString:@"FFF0"] ])];
+    if (!fullNow) {
         NSUInteger gen0 = _round;
         // 兜底第一段（1.2 秒）：FFF0 的特征已经回来、但里面没有 FFF6 ⇒ FFF6 在别的服务里。
         //   只有在「FFF0 特征确已回包」时才触发，避免特征发现稍慢就重复发起全量发现。
@@ -895,8 +906,11 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
             if (self->_wr) return;
             if (self->_car.state != CBPeripheralStateConnected) return;
             if (self->_fff0CharsDone) return;       // 已回过，交给第一段判定
-            SPLog(@"gatt", @"★ FFF0 服务发现 3.5 秒未回 —— 退回全量发现");
-            self->_fullDiscovery = YES;
+            SPLog(@"gatt", @"★ FFF0 服务发现 3.5 秒未回 —— 本条链路退回全量发现");
+            self->_fullOnce = YES;                  // ★ 1.2.11：原来是 _fullDiscovery = YES —— 把「车回得慢」
+                                                    //   误判成「拓扑里没有 FFF6」，且该标志只在蓝牙关闭时
+                                                    //   复位（见 centralManagerDidUpdateState），一次污染整场会话。
+                                                    //   真机铁证：10:34:56 FFF0 在 5.0 秒时正常回包。
             [self->_car discoverServices:nil];
         });
     }
@@ -956,7 +970,7 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
             [p discoverCharacteristics:@[ [CBUUID UUIDWithString:@"FFF1"],
                                           [CBUUID UUIDWithString:@"FFF6"] ]
                             forService:s];
-        } else if (_fullDiscovery) {
+        } else if (_fullDiscovery || _fullOnce) {   // ★ 1.2.11：救急全量也要把其它服务的特征问全
             // ★ 1.2.6：只有兜底模式下才逐个发现其它服务（正常路径省 5 次往返 ≈ 2 秒）
             [p discoverCharacteristics:nil forService:s];
         }
@@ -1020,9 +1034,13 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
                 //   （1.2.8 08:09:50 实测）。带上「距上次解锁多久」才能分清两种语义，
                 //   为后续「车已锁 ⇒ 才允许解锁」的门禁铺路。
                 NSTimeInterval sinceDone = (_doneAt > 0) ? (SPNow() - _doneAt) : -1.0;
-                SPLog(@"direct", @"状态帧 —— 忽略（距上次解锁 %.1f 秒，空闲 %.1f 秒，%s）",
+                // ★ 1.2.11：原来是 %s + C 字面量 —— SPLog 走 NSString initWithFormat:，
+                //   其中 %s 按**系统编码**解释（iOS 上是 MacRoman），而字面量是 UTF-8，
+                //   结果双重编码成「Áñë‰ººËΩ¶Áä∂ÊÄÅÂèòÊõ¥」（真机日志实证）。
+                //   改用 %@ + NSString 字面量，彻底绕开编码问题。
+                SPLog(@"direct", @"状态帧 —— 忽略（距上次解锁 %.1f 秒，空闲 %.1f 秒，%@）",
                       sinceDone, gap,
-                      (sinceDone < 0 || sinceDone > 60.0) ? "疑似车状态变更" : "解锁回执");
+                      (sinceDone < 0 || sinceDone > 60.0) ? @"疑似车状态变更" : @"解锁回执");
                 return;                 // 永不当按键
             }
             if (isPress || gap > 4.0) {
