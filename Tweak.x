@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.13"
+#define SPVER        @"1.2.14"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -423,6 +423,7 @@ static const unsigned char kStatusFrame[26] = {
                                                             //   触发 3.5 秒兜底，却写死了 _fullDiscovery ⇒ 之后
                                                             //   10:35:05 那条链路直接全量发现 6 个服务，
                                                             //   「连接→写特征就绪」由 1 秒涨到 5 秒，且永久生效。
+@property (nonatomic, assign) BOOL              carFromApp;    // ★ 1.2.14：车 UUID 来自官方 App plist（权威，不许被名字匹配覆盖）
 @property (nonatomic, assign) BOOL              pressQueued;   // ★ 1.2.13：握手期收到按键帧，本轮结束后补发
 @property (nonatomic, assign) NSTimeInterval    lastOkAt;      // ★ 1.2.12：上次成功解锁时刻
                                                             //   连上就解冷却门禁的锚点（600 秒）。
@@ -473,21 +474,15 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
 //──────────────────────── 扫描 / 连接 ────────────────────────
 - (void)beginScan:(NSString *)why {
     if (!_cm || _cm.state != CBManagerStatePoweredOn || _scanning) return;
-    NSTimeInterval now = SPNow();                  // ★ C3：单调时钟
-    if (now < _nextScanAt) return;                 // 冷却期内不扫，省电
-    _nextScanAt = now + 60.0;                      // 一轮扫完歇 60 秒（1.0.7 曾为加速实测改成 20，P1 恢复）
-    // ★ 不限定服务 UUID：无法确认车在广播里一定带 FFF0
-    //   （App 版靠 retrieve 已知 UUID 连车，**从未真正跑过扫描**，所以这点未经验证）。
-    //   改为全扫，再用「已知 UUID」或「名字前缀 SDH-」双重匹配（见 didDiscoverPeripheral）。
+    // ★ 1.2.14：断链期间**持续扫描**，不再「25 秒窗口 + 60 秒冷却」。
+    //   1.2.13 真机：19:39:24 断开 → 19:39:25 车就出现，说明车会**短促广播**；
+    //   旧占空比 25/85 ≈ 29%，即 71% 的时间我们是瞎的，根本无法区分
+    //   「车没广播」和「我们没听到」。
+    //   停止扫描统一交给 didConnectPeripheral「已连接」。
     NSDictionary *o = @{ CBCentralManagerScanOptionAllowDuplicatesKey: @NO };
     [_cm scanForPeripheralsWithServices:nil options:o];
     _scanning = YES;
     SPLog(@"link", @"开始扫描（全设备，%@）", why);
-    // 扫描窗口 25 秒，到点停
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
-                   SPQueue(), ^{                                   // ★ B1
-        [self stopScan:@"窗口结束"];
-    });
 }
 
 - (void)stopScan:(NSString *)why {
@@ -628,6 +623,15 @@ static NSDictionary *SPConnectOptions(void) {
 - (void)adopt:(CBPeripheral *)p why:(NSString *)why {
     if (!p.identifier) return;
     NSString *newUUID = p.identifier.UUIDString;
+    // ★ 1.2.14：UUID 来自官方 App 的 plist（retrieve 命中），是**权威值**。
+    //   1.2.13 常驻扫描后，「SDH-」名字前缀把 _car 抢到了另一台 SDH-4B834A 上
+    //   （真机 19:39:25），4 帧全部发给了别人的车。除非来源是权威渠道
+    //   （retrieve / 状态恢复 / UUID 命中），否则不许把已知的 App UUID 换掉。
+    if ([why isEqualToString:@"名字命中"] && _carFromApp && _carUUID.length &&
+        newUUID.length && ![_carUUID isEqualToString:newUUID]) {
+        SPLog(@"link", @"★ 拒绝换车：%@ 名字像但不是同一台（保留 App 权威 UUID）", p.name ?: @"(无名)");
+        return;
+    }
     // ★ 1.2.10：只有「换车」才清「本车会发按键帧」的记忆；同一台车反复 adopt 不能清
     if (_carUUID.length && newUUID.length && ![_carUUID isEqualToString:newUUID]) {
         _carSendsPress = NO;
@@ -636,6 +640,7 @@ static NSDictionary *SPConnectOptions(void) {
     _car = p;
     _carUUID = newUUID;
     if (p.name.length) _carName = p.name;
+    if ([why isEqualToString:@"retrieve"]) _carFromApp = YES;   // ★ 1.2.14：UUID 来自 App plist
     p.delegate = self;
     [[[NSUserDefaults alloc] initWithSuiteName:kPrefsSuite] setObject:_carUUID forKey:@"vehicle"];
     SPLog(@"link", @"认车 %@ (%@) — %@", _carName ?: @"(无名)", _carUUID, why);
@@ -902,8 +907,17 @@ static NSDictionary *SPConnectOptions(void) {
             return;
         }
         // ② 名字前缀命中（车名实测 SDH-xxxxxx）
+        // ★ 1.2.14：已知车名后必须**完全同名**才认。
+        //   「SDH-」只是品牌前缀，不是唯一标识 —— 现场同时有两台 SDH- 车
+        //   （SDH-49D6FD / SDH-4B834A）。1.2.13 把扫描改成常驻后立刻爆雷：
+        //   真机 19:39:25 UUID 命中你的车，同一秒名字命中了 SDH-4B834A，
+        //   _car 被抢走并重置按键帧记忆，随后 4 帧全发给了别人的车，
+        //   你的车那几轮一次都没解开（全程「换车」4 次、连错车 3 次）。
+        //   UUID 未知时才允许用前缀兜底（首次认车）。
         NSString *nm = p.name;
-        if (nm.length && strlen(kNamePrefix) && [nm hasPrefix:@(kNamePrefix)]) {
+        BOOL nameMatch = (nm.length && strlen(kNamePrefix) && [nm hasPrefix:@(kNamePrefix)]
+                          && (!_carName.length || [nm isEqualToString:_carName]));
+        if (nameMatch) {
             SPLog(@"link", @"★ 车出现 %@ RSSI=%@ — 名字命中", nm, RSSI);
             [self adopt:p why:@"名字命中"]; [self forceReconnect:@"名字命中"];
             return;
