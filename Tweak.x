@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.11"
+#define SPVER        @"1.2.12"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -423,6 +423,11 @@ static const unsigned char kStatusFrame[26] = {
                                                             //   触发 3.5 秒兜底，却写死了 _fullDiscovery ⇒ 之后
                                                             //   10:35:05 那条链路直接全量发现 6 个服务，
                                                             //   「连接→写特征就绪」由 1 秒涨到 5 秒，且永久生效。
+@property (nonatomic, assign) NSTimeInterval    lastOkAt;      // ★ 1.2.12：上次成功解锁时刻
+                                                            //   连上就解冷却门禁的锚点（600 秒）。
+                                                            //   1.2.11 真机：34.8 分钟 8 次自发解锁，
+                                                            //   其中 15:43:14 车发状态帧（疑似锁车）后
+                                                            //   2 分钟 15:45:31 我们无按键把车解开了。
 @property (nonatomic, assign) BOOL              fff0CharsDone; // ★ 1.2.6：本链路 FFF0 的特征是否已回
 @property (nonatomic, assign) NSTimeInterval    lastCarAt;     // ★ 1.2.7：上一条车帧时刻（判按键间隔）
 @property (nonatomic, assign) BOOL              forceSend;     // ★ 1.2.7：按键触发，绕过完成门禁与冷却
@@ -772,6 +777,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
             //   断开时 didDisconnectPeripheral 会把它清 0，下次靠近照样解锁。
             _doneLink = _linkAt;
             _doneAt   = SPNow();                       // ★ 1.2.6：时效窗起点
+            _lastOkAt = SPNow();                       // ★ 1.2.12：连上就解冷却锚点（任何来源的成功解锁都算）
             _stallRetries = 0;                         // ★ A1：本轮链路自愈计数归零
             SPLog(@"direct", @"★ 四帧发完（42 已确认）—— 耗时 %.0f ms（累计成功 %ld 次）",
                   (SPNow() - _startAt) * 1000.0, (long)_unlocks);   // ★ C3
@@ -996,7 +1002,27 @@ didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
         //   什么都不发（1.2.0 就被冷却吞过 3 次），结果日志口径比实际行为更"乐观"，
         //   上一轮"订阅/就绪/帧1/完成 计数自洽"的审计因此漏判。改为只陈述事实。
         SPLog(@"gatt", @"写特征 FFF6 就绪 —— 请求直发");
-        [self directBegin];
+        // ★ 1.2.12：连上就解加双门禁。
+        //   1.2.11 真机铁证（34.8 分钟验收段）：9 次断链（存活 3s~589s，全为车端
+        //   supervision timeout），每次重连都走到这里无条件 directBegin ⇒ 10 轮解锁里
+        //   8 轮是自发、用户只按了 2 次（平均每 4.3 分钟自动解一次，1.2.10 是 6 次/16 小时）。
+        //   根因：新链路会复位 _wr/_step/_redoOnLink（didConnectPeripheral）与 _lastAt
+        //   （didDisconnectPeripheral），新链路 _doneLink != _linkAt ⇒ directBegin 里三道
+        //   守卫全部不成立，等于「连上必发 4 帧」。
+        //   门禁①：挂起 ≥60 秒 = 车之前在睡、用户走近，此时自动解锁才有意义；
+        //          链路抖动后的秒级重连（实测 1~3 秒）必须跳过。
+        //   门禁②：距上次成功解锁 ≥600 秒 = 刚解过就不重复解。
+        //   按键路径不经过此处（onCarFrame 直接调 directBegin），完全不受影响。
+        NSTimeInterval wait = (_connAt > 0) ? (SPNow() - _connAt) : -1.0;
+        BOOL longHeld = (wait >= 60.0);
+        BOOL cooled   = (_lastOkAt <= 0) || (SPNow() - _lastOkAt >= 600.0);
+        if (longHeld && cooled) {
+            [self directBegin];
+        } else if (_dirLogAt == 0 || SPNow() - _dirLogAt > 5.0) {
+            _dirLogAt = SPNow();
+            SPLog(@"gatt", @"连上就解已跳过（挂起 %.0f 秒 / 距上次解锁 %.0f 秒；门槛 60 / 600）—— 等按键",
+                  wait, _lastOkAt > 0 ? SPNow() - _lastOkAt : -1.0);
+        }
     }
 }
 
