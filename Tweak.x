@@ -26,8 +26,9 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#import <os/log.h>
 
-#define SPVER        @"1.2.15"
+#define SPVER        @"1.3.0"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -429,6 +430,9 @@ static const unsigned char kStatusFrame[26] = {
 @property (nonatomic, assign) NSTimeInterval     lastConnAt;    // ★ 1.2.15：最近一次真正连上的时刻（弱信号兜底用）
 @property (nonatomic, assign) NSTimeInterval     rssiLogAt;     // ★ 1.2.15：RSSI 日志限流
 @property (nonatomic, assign) BOOL              pressQueued;   // ★ 1.2.13：握手期收到按键帧，本轮结束后补发
+@property (nonatomic, assign) NSTimeInterval    connReqAt;     // ★ 1.3.0：最近一次下发连接请求的时刻（forceReconnect 节流）
+@property (nonatomic, assign) BOOL              linkReady;     // ★ 1.3.0：本链路 GATT 已就绪过（didConnect 里取快照用，_wr 清零会丢）
+@property (nonatomic, assign) BOOL              unlockOnReady; // ★ 1.3.0：本链路 GATT 就绪后是否自动解一轮（睡醒才 YES）
 @property (nonatomic, assign) NSTimeInterval    lastOkAt;      // ★ 1.2.12：上次成功解锁时刻
                                                             //   连上就解冷却门禁的锚点（600 秒）。
                                                             //   1.2.11 真机：34.8 分钟 8 次自发解锁，
@@ -476,9 +480,6 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
 }
 
 //──────────────────────── 扫描 / 连接 ────────────────────────
-// ★ 1.2.15：连接门限。RSSI ≥ -80 dBm 大致相当于「十米以内」。
-//   1.2.14 真机三次「车出现」全是 -95 / -98 / -99，连上后解锁中位 2275 ms。
-static const NSInteger kRSSIConnect = -80;
 
 - (void)beginScan:(NSString *)why {
     if (!_cm || _cm.state != CBManagerStatePoweredOn || _scanning) return;
@@ -515,8 +516,15 @@ static NSDictionary *SPConnectOptions(void) {
 - (void)forceReconnect:(NSString *)why {
     if (!_cm || _cm.state != CBManagerStatePoweredOn) return;
     if (!_car || _car.state == CBPeripheralStateConnected) return;
+    // ★ 1.3.0：节流。AllowDuplicates 开着时车每秒会回调多次，原来每个广播包都
+    //   重新下发一次 connectPeripheral + 打两条日志（靠近时每秒数条，加速轮转）。
+    //   pending connect 挂着时重复下发无任何收益，3 秒内只下发一次。
+    NSTimeInterval fnow = SPNow();
+    if (_connReqAt > 0 && fnow - _connReqAt < 3.0) return;
+    _connReqAt = fnow;
     SPLog(@"link", @"扫描命中 → 重新下发连接请求（%@，外设状态=%ld）", why, (long)_car.state);
     _connecting = YES;
+    if (!_connAt) _connAt = fnow;               // 守卫哨兵锚点；不改写早先的请求时刻
     [_cm connectPeripheral:_car options:SPConnectOptions()];
 }
 
@@ -612,25 +620,17 @@ static NSDictionary *SPConnectOptions(void) {
         return;
     }
     if (_car.state == CBPeripheralStateConnected || _car.state == CBPeripheralStateConnecting) return;
-    // ★ 1.2.15：未靠近就不主动连（RSSI 门禁）。
-    //   连接请求交给 didDiscoverPeripheral 命中「RSSI ≥ 门槛」时触发（forceReconnect）。
-    //   这样人在屋里（-95）不会连、不会解锁、不耗电；走近到 -80 以內才连。
-    //   兜底：连续 900 秒没连上，而最近 120 秒看到过车（任意信号），仍连一次。
-    NSTimeInterval nnow = SPNow();
-    BOOL near   = (_lastRSSI >= kRSSIConnect);
-    BOOL rescue = (_lastRSSI != 0 &&
-                   (_lastConnAt <= 0 || nnow - _lastConnAt > 900.0) &&
-                   (_lastSeenAt > 0 && nnow - _lastSeenAt < 120.0));
-    if (!near && !rescue) {
-        if (nnow - _rssiLogAt > 30.0) {
-            _rssiLogAt = nnow;
-            SPLog(@"link", @"未靠近（最近 RSSI=%ld < %d）—— 暂不下发连接，持续扫描等待",
-                  (long)_lastRSSI, kRSSIConnect);
-        }
-        return;
-    }
+    // ★ 1.3.0：撤销 1.2.15 的 RSSI 连接门禁 —— 连接提前备好是「按键秒解锁」的前提。
+    //   1.2.15 把「连接」和「解锁」绑在一起设门禁：RSSI ≥ -80 才连。但按键帧要靠
+    //   已建立的链路承载 —— 走近到 -80 才开始连，连上还要 1~3 秒 GATT 就绪，
+    //   正好撞上用户按第一下的窗口，反而变慢。
+    //   现在拆开：连接恢复 pending connect 常挂（iOS 持有，零扫描零耗电，车一广播
+    //   即连，链路提前备好）；「要不要解锁」由 directBegin 侧负责（按键帧触发 /
+    //   睡醒补一次），人在远处不按键就不会发帧，1.2.15 想防的「远处自动解锁」
+    //   同样不会发上。RSSI 只留作日志参考（_lastRSSI/_lastSeenAt 仍在 didDiscover 更新）。
     _connecting = YES;
     _connAt = SPNow();                                        // ★ 1.2.2：记下发时刻
+    _connReqAt = _connAt;                                     // ★ 1.3.0：节流锚点
     SPLog(@"link", @"连接请求 -> %@", _carName ?: _carUUID ?: @"(未知)");
     [_cm connectPeripheral:_car options:SPConnectOptions()];   // ★ 1.2.13：iOS 17+ 带系统自动重连
     // ★ 1.2.10：删除 1.2.9 的「独立 8 秒超时检查」—— 不再需要。
@@ -905,6 +905,8 @@ static NSDictionary *SPConnectOptions(void) {
         _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _lastAt = 0;
         _doneAt = 0; _redoOnLink = 0; _fullDiscovery = NO; _fff0CharsDone = NO;   // ★ 1.2.6：时效窗与发现模式一并复位
         _carSendsPress = NO;    // ★ 1.2.10：蓝牙重开 → 重新观察本车是否发按键帧
+        _connAt = 0; _connReqAt = 0; _linkReady = NO; _unlockOnReady = NO;   // ★ 1.3.0
+        _lastRSSI = 0; _lastSeenAt = 0;   // ★ 1.3.0：旧信号痕迹不带到新蓝牙会话
     }
 }
 
@@ -945,30 +947,13 @@ static NSDictionary *SPConnectOptions(void) {
                 return;
             }
         }
-        // ★ 1.2.15：RSSI 门禁 —— 只有「真的靠近」才连。
-        //   1.2.14 真机：95 分钟里车只出现 3 次，RSSI 全是 -95 / -98 / -99（很远），
-        //   连上后每帧往返都慢，解锁中位退化到 2275 ms（1.2.11 好信号时是 1200 ms）。
-        //   而且每次连上都会解锁一轮 —— 人在 100 米外车就被解开，纯属浪费。
-        //   现在：RSSI ≥ -80 才发起连接；弱信号只记录、不连。
-        //   兜底：若已连续 900 秒没连上，而最近 120 秒看到过车（任意信号），
-        //   仍允许连一次，避免「信号一直偏弱 → 永久失联」。
+        // ★ 1.3.0：识别与日志保留，但 RSSI 不再作为连接门禁（连接提前备好，
+        //   按键才有链路可承载）。1.2.15 曾在这里按 RSSI ≥ -80 拦截，已撤销。
         NSTimeInterval now = SPNow();
         _lastRSSI   = RSSI.integerValue;
         _lastSeenAt = now;
-        BOOL near   = (_lastRSSI >= kRSSIConnect);
-        BOOL rescue = (!near && _lastRSSI != 0 &&
-                       (_lastConnAt <= 0 || now - _lastConnAt > 900.0));
-        if (!(near || rescue)) {
-            if (now - _rssiLogAt > 30.0) {
-                _rssiLogAt = now;
-                SPLog(@"link", @"车在远处 %@ RSSI=%ld < %d —— 暂不连接", nm ?: @"(无名)",
-                      (long)_lastRSSI, kRSSIConnect);
-            }
-            return;
-        }
-        SPLog(@"link", @"★ 车出现 %@ RSSI=%ld（门槛 %d%@）— %@",
-              nm ?: @"(无名)", (long)_lastRSSI, kRSSIConnect,
-              near ? @"" : @"，弱信号兜底", isMine ? @"UUID 命中" : @"名字命中");
+        SPLog(@"link", @"★ 车出现 %@ RSSI=%ld — %@",
+              nm ?: @"(无名)", (long)_lastRSSI, isMine ? @"UUID 命中" : @"名字命中");
         [self adopt:p why:(isMine ? @"UUID 命中" : @"名字命中")];
         [self forceReconnect:(isMine ? @"UUID 命中" : @"名字命中")];
     } @catch (NSException *e) { SPLog(@"link", @"didDiscover 异常: %@", e.reason); }
@@ -986,6 +971,25 @@ static NSDictionary *SPConnectOptions(void) {
                          //   官方 App 的 _backoff 是实例变量并在 7 处主动重置。
     _wr = nil; _nt = nil; _step = 0;
     _redoOnLink = 0; _fff0CharsDone = NO; _fullOnce = NO;
+    // ★ 1.3.0：1.2.13 恢复了「连上就解」无条件，必须撤回 —— 那是链路抖动连发的根因
+    //   （1.2.12 真机：34.8 分钟 9 次断链、10 轮解锁里 8 轮自发）。但 1.2.12 的
+    //   「挂起≥60s 且 距上次解锁≥600s」双门禁又把真实需求挡掉（靠近不按键不解）。
+    //   1.3.0 的门禁按「按键秒解锁」目标设计：
+    //     · 链路在 pending 里挂了 ≥20 秒才连上 ⇒ 车刚从睡中醒来、人走近 —— 自动解一轮；
+    //     · 秒级闪断重连（车端 supervision timeout，实测 1~3 秒）⇒ 不自动解，
+    //       避免「链路一抖就解一次」；这种链路上用户要开，按一下车上开关即可
+    //       （按键帧直达 directBegin，不受本门禁影响）。
+    //   快照必须在上面 _wr=nil 清零之前取（didDisconnect 也清了 _wr，闪断时 _wr 为 nil）。
+    NSTimeInterval cnow0 = SPNow();
+    BOOL sleptWake    = (_connAt > 0 && cnow0 - _connAt >= 20.0);
+    BOOL flapRelink   = (_lastCarAt > 0 && cnow0 - _lastCarAt < 30.0) || _linkReady;
+    _linkReady        = NO;                        // 新链路，等 GATT 就绪再置
+    _unlockOnReady    = (sleptWake && !flapRelink);
+    if (!_unlockOnReady) {
+        SPLog(@"link", @"本次连接不自动解锁（挂起 %.1f 秒%@）—— 等按键帧",
+              (_connAt > 0 ? cnow0 - _connAt : -1.0),
+              flapRelink ? @"，链路抖动重连" : @"");
+    }
     // ★ 1.2.6：新链路 —— 补发计数复位；_fullDiscovery 跨链路保留
     // ★ 1.2.11：_fullOnce（救急用的一次性全量）必须每条链路复位，
     //   否则一次慢回包会把后面所有链路都拖进 5 秒全量发现（1.2.10 真机实测）。
@@ -1044,6 +1048,9 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
     BOOL gattReady = (_wr != nil);                      // ★ 1.2.6：必须在清 _wr 之前取
     _step = 0; _wr = nil; _nt = nil; _doneLink = 0; _linkAt = 0; _saw42 = NO;
     _doneAt = 0; _redoOnLink = 0; _lastCarAt = 0;       // ★ 1.2.7：新链路，时效窗/补发计数/车帧时刻作废
+    _unlockOnReady = NO;                                // ★ 1.3.0：链路作废
+    //   注意：_linkReady 不清 —— 它是「上一条链路 GATT 曾就绪」的快照，didConnect
+    //   靠它区分「睡醒首连（自动解）」和「闪断重连（不自动解）」，在那里才复位。
     // ★ 1.2.1：冷却锚点也必须随链路作废。1.2.0 在这里清了一堆状态却漏了 _lastAt，
     //   导致「发到一半链路被断 → 立刻重连 → 新链路就绪」时，directBegin 被上一条链路的
     //   20 秒冷却在第 545 行静默 return（零日志），只能等 SPTick 下一拍补发。
@@ -1108,29 +1115,18 @@ didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
     }
     if (_wr) {
         _linkAt = SPNow();                             // ★ C3：记号：本链路
-        // ★ 1.2.1：原文案「→ 立刻直发」是**提前宣称**——它先喊再调 directBegin，喊完可能
-        //   什么都不发（1.2.0 就被冷却吞过 3 次），结果日志口径比实际行为更"乐观"，
-        //   上一轮"订阅/就绪/帧1/完成 计数自洽"的审计因此漏判。改为只陈述事实。
+        _linkReady = YES;                              // ★ 1.3.0：本链路 GATT 已就绪（闪断重连判定用）
         SPLog(@"gatt", @"写特征 FFF6 就绪 —— 请求直发");
-        // ★ 1.2.12：连上就解加双门禁。
-        //   1.2.11 真机铁证（34.8 分钟验收段）：9 次断链（存活 3s~589s，全为车端
-        //   supervision timeout），每次重连都走到这里无条件 directBegin ⇒ 10 轮解锁里
-        //   8 轮是自发、用户只按了 2 次（平均每 4.3 分钟自动解一次，1.2.10 是 6 次/16 小时）。
-        //   根因：新链路会复位 _wr/_step/_redoOnLink（didConnectPeripheral）与 _lastAt
-        //   （didDisconnectPeripheral），新链路 _doneLink != _linkAt ⇒ directBegin 里三道
-        //   守卫全部不成立，等于「连上必发 4 帧」。
-        //   门禁①：挂起 ≥60 秒 = 车之前在睡、用户走近，此时自动解锁才有意义；
-        //          链路抖动后的秒级重连（实测 1~3 秒）必须跳过。
-        //   门禁②：距上次成功解锁 ≥600 秒 = 刚解过就不重复解。
-        //   按键路径不经过此处（onCarFrame 直接调 directBegin），完全不受影响。
-        // ★ 1.2.13：恢复「连上就解」为无条件。
-        //   1.2.12 的双门禁（挂起≥60 秒 且 距上次解锁≥600 秒）是按「抑制自发解锁」这个
-        //   我自己设想的目标加的；但老大明确了真实需求：
-        //        「不管什么时候，24 小时随时，只要我的手机靠近车辆就能秒解锁车辆」
-        //   门禁恰好把需求本身挡掉了 —— 撤除。
-        //   靠近 → 链路恢复 → 立即解锁，这才是「无感解锁」。防连发由 directBegin 内部的
-        //   20 秒同链路冷却与本链路的完成守卫负责，不需要在入口再设一道时间门槛。
-        [self directBegin];
+        // ★ 1.3.0：GATT 就绪后是否立刻发一轮，由 didConnect 里的「睡醒补一次」门禁
+        //   决定（_unlockOnReady）。链路抖动秒级重连不再自动解（那是 1.2.12/1.2.13
+        //   的自发连发根因）；按键路径不走这里（onCarFrame 带 _forceSend 直调
+        //   directBegin），「靠近 → 按键 → 秒解锁」不受影响。
+        if (_unlockOnReady) {
+            _unlockOnReady = NO;                       // 每链路只补一次
+            [self directBegin];
+        } else {
+            SPLog(@"direct", @"本链路不自动解锁 —— 等按键帧触发");
+        }
     }
 }
 
@@ -1241,9 +1237,13 @@ static void SPTick(SPUnlocker *u) {
     } @catch (NSException *e) { /* 吞 */ }
 }
 
-//════════════════════════════ 入口（Theos/logos）════════════════════════════
-%ctor {
+//════════════════════════════ 入口（纯 Objective-C，替代 Logos %ctor）════════════════════════════
+#ifndef APELIN_BUILD_ID
+#define APELIN_BUILD_ID "dev"
+#endif
+__attribute__((constructor)) static void SPInit(void) {
     @try {
+        os_log(OS_LOG_DEFAULT, "ApelinLoaded %{public}s", APELIN_BUILD_ID);
         // ★ C1：先初始化日志，让"安全阀被检查过"变成可验证事实。1.1.6 的 return 发生在
         //   日志初始化之前，开关到底有没有被检查，从日志上完全看不出来。
         SPLogInit();
