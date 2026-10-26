@@ -27,7 +27,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define SPVER        @"1.2.12"
+#define SPVER        @"1.2.13"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -423,6 +423,7 @@ static const unsigned char kStatusFrame[26] = {
                                                             //   触发 3.5 秒兜底，却写死了 _fullDiscovery ⇒ 之后
                                                             //   10:35:05 那条链路直接全量发现 6 个服务，
                                                             //   「连接→写特征就绪」由 1 秒涨到 5 秒，且永久生效。
+@property (nonatomic, assign) BOOL              pressQueued;   // ★ 1.2.13：握手期收到按键帧，本轮结束后补发
 @property (nonatomic, assign) NSTimeInterval    lastOkAt;      // ★ 1.2.12：上次成功解锁时刻
                                                             //   连上就解冷却门禁的锚点（600 秒）。
                                                             //   1.2.11 真机：34.8 分钟 8 次自发解锁，
@@ -496,6 +497,27 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     SPLog(@"link", @"停止扫描（%@）", why);
 }
 
+// ★ 1.2.13：连接选项。iOS 17+ 带「允许系统自动重连」，让 bluetoothd 替我们守着回连；
+//   官方 App 同样做法（SundiroBLE.m:583-586）。iOS 16 上不传，避免未知 key 引发异常。
+static NSDictionary *SPConnectOptions(void) {
+    if (@available(iOS 17.0, *)) return @{ @"kCBConnectOptionEnableAutoReconnect": @YES };
+    return nil;
+}
+
+// ★ 1.2.13：扫描扫到车时，强制重新下发连接请求。
+//   原因：pending connect 可能已静默失效，而 _connecting 守卫仍是 YES、外设状态仍报
+//   Connecting(1)，于是 tryConnect 会在 `if (_connecting)` 与 `if (state==Connecting)`
+//   两道守卫上直接早退 —— 扫到了也连不上。真机 1.2.12 实测 pending 空转 31 分 46 秒，
+//   心跳全程「外设状态=1 写特征=无」，正是这种「系统说在连、其实没在连」的状态。
+//   注意：不修改 _connAt —— 它记录的是「最早那次请求」，用来判定车睡了多久。
+- (void)forceReconnect:(NSString *)why {
+    if (!_cm || _cm.state != CBManagerStatePoweredOn) return;
+    if (!_car || _car.state == CBPeripheralStateConnected) return;
+    SPLog(@"link", @"扫描命中 → 重新下发连接请求（%@，外设状态=%ld）", why, (long)_car.state);
+    _connecting = YES;
+    [_cm connectPeripheral:_car options:SPConnectOptions()];
+}
+
 - (void)tryConnect {
     if (!_cm || _cm.state != CBManagerStatePoweredOn) return;
     if (!_car) {
@@ -523,6 +545,16 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         }
     }
     if (!_car) { [self beginScan:@"还没有车对象"]; return; }
+    // ★ 1.2.13：车已认到、但没连上时**也必须扫描**。
+    //   原来 beginScan 全工程只有上面 `if (!_car)` 一个调用点，车一认到（retrieve 命中）
+    //   就永久停扫 ⇒ 整份 1.2.12 真机日志 259 KB 里「开始扫描」**0 条**，
+    //   我们 100% 依赖 iOS 的 pending connect。
+    //   实测它会静默失效：18:37:37 断开后 pending 挂了 31 分 46 秒（心跳 外设状态=1
+    //   全程为 1，即 iOS 自认为还在连），期间完全失明，用户 19:08 按的每一次都没有
+    //   链路可承载。官方 App 三保险（startScan + EnableAutoReconnect + 30 秒 watchdog）
+    //   我们一道都没有，见 /var/minis/shared/SundiroBLE/sble/SundiroBLE.m:586/698。
+    //   扫描本身也带诊断价值：扫得到车 ⇒ pending 失效（可修）；扫不到 ⇒ 车端不广播。
+    if (_car.state != CBPeripheralStateConnected) [self beginScan:@"等待车广播"];
     // ★ B2：_car.state 要等 CoreBluetooth 异步处理后才变 Connecting，而三个调用者
     //   （状态回调 / retryLater / SPTick）可能同时通过状态守卫 → 同秒双发 connect。
     //   1.1.6 日志铁证：16:52:40 两条「连接请求」，紧接着 16:52:44 Failed to encrypt。
@@ -581,7 +613,7 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
     _connecting = YES;
     _connAt = SPNow();                                        // ★ 1.2.2：记下发时刻
     SPLog(@"link", @"连接请求 -> %@", _carName ?: _carUUID ?: @"(未知)");
-    [_cm connectPeripheral:_car options:nil];
+    [_cm connectPeripheral:_car options:SPConnectOptions()];   // ★ 1.2.13：iOS 17+ 带系统自动重连
     // ★ 1.2.10：删除 1.2.9 的「独立 8 秒超时检查」—— 不再需要。
     //   撤销后 pending connect 一直挂着，车广播即连；SPTick 每 15 秒一拍足够处理真卡死。
     NSUInteger gen = _round;
@@ -718,7 +750,18 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         if (L == 26) {
             const uint8_t *hb = (const uint8_t *)d.bytes;
             if (memcmp(hb, kPressFrame, 26) == 0 || memcmp(hb, kStatusFrame, 26) == 0) {
-                SPLog(@"direct", @"握手进行中收到按键/状态帧 —— 忽略（step=%ld）", (long)_step);
+                // ★ 1.2.13：握手期收到**按键帧**不能再白丢 —— 记下来，本轮结束立刻补一轮。
+                //   1.2.12 真机铁证：19:09:24 插件自发开轮，19:09:27 用户按键帧到达被丢弃，
+                //   随后该轮 8 秒无回复触发自愈重发，19:09:34 才完成 —— 用户按下去到解开
+                //   共 7 秒，而如果没被丢，那一下本来 1.5 秒就能完成。
+                //   上限 1 次，避免连续按键把轮次拖成风暴。
+                BOOL isPressNow = (memcmp(hb, kPressFrame, 26) == 0);
+                if (isPressNow && !_pressQueued) {
+                    _pressQueued = YES;
+                    SPLog(@"direct", @"★ 握手期收到按键帧 —— 已排队，本轮结束后补发（step=%ld）", (long)_step);
+                } else {
+                    SPLog(@"direct", @"握手进行中收到按键/状态帧 —— 忽略（step=%ld）", (long)_step);
+                }
                 return;
             }
         }
@@ -782,6 +825,14 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
             SPLog(@"direct", @"★ 四帧发完（42 已确认）—— 耗时 %.0f ms（累计成功 %ld 次）",
                   (SPNow() - _startAt) * 1000.0, (long)_unlocks);   // ★ C3
             _step = 0;
+            // ★ 1.2.13：握手期被挡下的按键，本轮结束后立即补一轮（按键不白按）
+            if (_pressQueued) {
+                _pressQueued = NO;
+                SPLog(@"direct", @"★ 补发握手期排队的那一下");
+                _forceSend = YES;
+                [self directBegin];
+                _forceSend = NO;
+            }
         }
     } @catch (NSException *e) { SPLog(@"direct", @"onCarFrame 异常: %@", e.reason); _step = 0; }
 }
@@ -845,14 +896,16 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
         if (p.identifier.UUIDString && _carUUID.length &&
             [_carUUID caseInsensitiveCompare:p.identifier.UUIDString] == NSOrderedSame) {
             SPLog(@"link", @"★ 车出现 %@ RSSI=%@ — UUID 命中", p.name ?: @"(无名)", RSSI);
-            [self stopScan:@"已锁定"]; [self adopt:p why:@"UUID 命中"]; [self tryConnect];
+            // ★ 1.2.13：不再「一看到就停扫」—— 扫到不等于连上，连接失败时停扫会让我们
+            //   在冷却期内再也看不到车。停扫改由 didConnectPeripheral「已连接」负责。
+            [self adopt:p why:@"UUID 命中"]; [self forceReconnect:@"UUID 命中"];
             return;
         }
         // ② 名字前缀命中（车名实测 SDH-xxxxxx）
         NSString *nm = p.name;
         if (nm.length && strlen(kNamePrefix) && [nm hasPrefix:@(kNamePrefix)]) {
             SPLog(@"link", @"★ 车出现 %@ RSSI=%@ — 名字命中", nm, RSSI);
-            [self stopScan:@"已锁定"]; [self adopt:p why:@"名字命中"]; [self tryConnect];
+            [self adopt:p why:@"名字命中"]; [self forceReconnect:@"名字命中"];
             return;
         }
         // ③ 其余只在日志留痕（低频，别刷屏）
@@ -1013,16 +1066,14 @@ didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
         //          链路抖动后的秒级重连（实测 1~3 秒）必须跳过。
         //   门禁②：距上次成功解锁 ≥600 秒 = 刚解过就不重复解。
         //   按键路径不经过此处（onCarFrame 直接调 directBegin），完全不受影响。
-        NSTimeInterval wait = (_connAt > 0) ? (SPNow() - _connAt) : -1.0;
-        BOOL longHeld = (wait >= 60.0);
-        BOOL cooled   = (_lastOkAt <= 0) || (SPNow() - _lastOkAt >= 600.0);
-        if (longHeld && cooled) {
-            [self directBegin];
-        } else if (_dirLogAt == 0 || SPNow() - _dirLogAt > 5.0) {
-            _dirLogAt = SPNow();
-            SPLog(@"gatt", @"连上就解已跳过（挂起 %.0f 秒 / 距上次解锁 %.0f 秒；门槛 60 / 600）—— 等按键",
-                  wait, _lastOkAt > 0 ? SPNow() - _lastOkAt : -1.0);
-        }
+        // ★ 1.2.13：恢复「连上就解」为无条件。
+        //   1.2.12 的双门禁（挂起≥60 秒 且 距上次解锁≥600 秒）是按「抑制自发解锁」这个
+        //   我自己设想的目标加的；但老大明确了真实需求：
+        //        「不管什么时候，24 小时随时，只要我的手机靠近车辆就能秒解锁车辆」
+        //   门禁恰好把需求本身挡掉了 —— 撤除。
+        //   靠近 → 链路恢复 → 立即解锁，这才是「无感解锁」。防连发由 directBegin 内部的
+        //   20 秒同链路冷却与本链路的完成守卫负责，不需要在入口再设一道时间门槛。
+        [self directBegin];
     }
 }
 
