@@ -28,7 +28,7 @@
 #include <sys/stat.h>
 #import <os/log.h>
 
-#define SPVER        @"1.3.1"
+#define SPVER        @"1.3.2"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -1012,11 +1012,12 @@ static NSDictionary *SPConnectOptions(void) {
     BOOL flapRelink   = (_lastCarAt > 0 && cnow0 - _lastCarAt < 30.0) || _linkReady;
     _linkReady        = NO;                        // 新链路，等 GATT 就绪再置
     _unlockOnReady    = (sleptWake && !flapRelink);
-    if (!_unlockOnReady) {
-        SPLog(@"link", @"本次连接不自动解锁（挂起 %.1f 秒%@）—— 等按键帧",
-              (_connAt > 0 ? cnow0 - _connAt : -1.0),
-              flapRelink ? @"，链路抖动重连" : @"");
-    }
+    // ★ 1.3.2（C1）：自动解锁已彻底取消，这里只保留一段说明性日志。
+    //   1.3.1 真机 216 分钟：37 轮解锁里 32 轮是自动的（86%），平均 6.8 分钟一次。
+    //   用户目标始终是「按车辆解锁键秒解锁」，按键走 onCarFrame → directBegin 独立路径。
+    SPLog(@"link", @"本次连接不自动解锁 —— 只认按键帧（挂起 %.1f 秒）",
+          (_connAt > 0 ? cnow0 - _connAt : -1.0));
+    (void)sleptWake; (void)flapRelink;             // 保留计算，仅用于上面的日志口径
     // ★ 1.2.6：新链路 —— 补发计数复位；_fullDiscovery 跨链路保留
     // ★ 1.2.11：_fullOnce（救急用的一次性全量）必须每条链路复位，
     //   否则一次慢回包会把后面所有链路都拖进 5 秒全量发现（1.2.10 真机实测）。
@@ -1154,12 +1155,18 @@ didDiscoverCharacteristicsForService:(CBService *)svc error:(NSError *)e {
         //   决定（_unlockOnReady）。链路抖动秒级重连不再自动解（那是 1.2.12/1.2.13
         //   的自发连发根因）；按键路径不走这里（onCarFrame 带 _forceSend 直调
         //   directBegin），「靠近 → 按键 → 秒解锁」不受影响。
-        if (_unlockOnReady) {
-            _unlockOnReady = NO;                       // 每链路只补一次
-            [self directBegin];
-        } else {
-            SPLog(@"direct", @"本链路不自动解锁 —— 等按键帧触发");
-        }
+        // ★ 1.3.2（C1）：彻底取消「GATT 就绪就自动解一轮」。
+        //   1.3.1 真机（216 分钟，链路可用率已升到 55.3%）：37 轮解锁里**只有 5 轮是
+        //   用户按的，其余 32 轮全自动**（平均每 6.8 分钟车自己解开一次）。
+        //   根因：1.3.0 的「睡醒补一次」用 _connAt 挂起时长判「车是否刚醒」，但在
+        //   弱信号下链路频繁断开重连（41 次），每次重连都满足 sleptWake 条件，
+        //   A（掉线即刻重连）把链路修好之后，反而把这个副作用放大了 9 倍。
+        //   关键事实：**按键路径根本不经过这里**（onCarFrame 带 _forceSend 直调
+        //   directBegin），所以删掉这段不影响「按键秒解锁」——
+        //   真机 5/5 全中：1243 / 1315 / 1275 / 1345 / 1282 ms。
+        //   而用户的目标从来是「按车辆解锁键秒解锁」，不是「走近自己开」。
+        _unlockOnReady = NO;                           // ★ 1.3.2：永不自发解锁
+        SPLog(@"direct", @"本链路不自动解锁 —— 只认按键帧（1.3.2/C1）");
     }
 }
 
@@ -1264,9 +1271,17 @@ static void SPTick(SPUnlocker *u) {
         if (!u.armed) return;
         if (!u.car || u.car.state != CBPeripheralStateConnected) {
             [u tryConnect];
-        } else if (u.wr && u.step == 0) {
-            [u directBegin];
         }
+        // ★ 1.3.2（C1）：删掉这里原本的 `[u directBegin]`。
+        //   1.3.1 真机 216 分钟：37 轮解锁里只有 5 轮是用户按的，其余 **32 轮全自动**
+        //   （平均每 6.8 分钟车自己解开一次）。主因就是这一句 —— SPTick 每 15 秒一拍，
+        //   只要「已连接 + 写特征就绪 + 空闲」，就去 directBegin 试一发。
+        //   而新链路 _doneLink != _linkAt，directBegin 内部的「本链路已完成」守卫不成立
+        //   ⇒ 每重连一次，最多 15 秒内必然自动解一轮。1.3.1 的 A（0.15 秒即刻重连）
+        //   把重连次数从 12 拉到 41，于是自动解锁从 9 次涨到 32 次 —— 修好链路的副作用。
+        //   按键路径完全独立（onCarFrame → _forceSend + directBegin），不受影响：
+        //   真机 5/5 全中，1243 / 1315 / 1275 / 1345 / 1282 ms。
+        //   握手自愈（armWatchdog 里的 8 秒重发）也保留，它只在 _step != 0 时触发。
     } @catch (NSException *e) { /* 吞 */ }
 }
 
