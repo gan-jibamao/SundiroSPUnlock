@@ -28,7 +28,7 @@
 #include <sys/stat.h>
 #import <os/log.h>
 
-#define SPVER        @"1.3.0"
+#define SPVER        @"1.3.1"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -429,6 +429,9 @@ static const unsigned char kStatusFrame[26] = {
 @property (nonatomic, assign) NSTimeInterval     lastSeenAt;    // ★ 1.2.15：最近一次看到车的时刻
 @property (nonatomic, assign) NSTimeInterval     lastConnAt;    // ★ 1.2.15：最近一次真正连上的时刻（弱信号兜底用）
 @property (nonatomic, assign) NSTimeInterval     rssiLogAt;     // ★ 1.2.15：RSSI 日志限流
+@property (nonatomic, assign) NSInteger          rssiPrev;      // ★ 1.3.1：上一次 RSSI（判趋势用）
+@property (nonatomic, assign) NSInteger          risingCount;   // ★ 1.3.1：RSSI 连续变强的次数
+@property (nonatomic, assign) NSTimeInterval     trendConnAt;   // ★ 1.3.1：趋势预连节流
 @property (nonatomic, assign) BOOL              pressQueued;   // ★ 1.2.13：握手期收到按键帧，本轮结束后补发
 @property (nonatomic, assign) NSTimeInterval    connReqAt;     // ★ 1.3.0：最近一次下发连接请求的时刻（forceReconnect 节流）
 @property (nonatomic, assign) BOOL              linkReady;     // ★ 1.3.0：本链路 GATT 已就绪过（didConnect 里取快照用，_wr 清零会丢）
@@ -950,11 +953,35 @@ static NSDictionary *SPConnectOptions(void) {
         // ★ 1.3.0：识别与日志保留，但 RSSI 不再作为连接门禁（连接提前备好，
         //   按键才有链路可承载）。1.2.15 曾在这里按 RSSI ≥ -80 拦截，已撤销。
         NSTimeInterval now = SPNow();
-        _lastRSSI   = RSSI.integerValue;
+        NSInteger r = RSSI.integerValue;
+        // ★ 1.3.1（B）：RSSI 趋势预连。
+        //   1.3.0 真机 360 分钟实证：链路可用率仅 5.9%，而两次命中按键
+        //   （10:36:13 / 11:03:37）都是「刚好落在链路活着的窗口」。也就是说——
+        //   按键能不能秒解，取决于按下的那一刻链路是否还活着。
+        //   遥测显示车在 30 米内 RSSI 中位 -94（穿墙），连接本身就在临界点上。
+        //   这里加一层：当 RSSI 连续 3 次变强（人正在走近），提前发起连接，
+        //   争取让用户走到车旁时链路已经备好，按第一下就能中。
+        //   节流 60 秒，避免同一波接近重复下发。
+        if (_lastRSSI != 0 && r > _lastRSSI + 2) {
+            _risingCount++;
+        } else if (r <= _lastRSSI) {
+            _risingCount = 0;
+        }
+        _rssiPrev   = _lastRSSI;
+        _lastRSSI   = r;
         _lastSeenAt = now;
-        SPLog(@"link", @"★ 车出现 %@ RSSI=%ld — %@",
-              nm ?: @"(无名)", (long)_lastRSSI, isMine ? @"UUID 命中" : @"名字命中");
+        BOOL trending = (_risingCount >= 3 && (now - _trendConnAt > 60.0));
+        if (trending) _trendConnAt = now;
+        SPLog(@"link", @"★ 车出现 %@ RSSI=%ld%s — %@",
+              nm ?: @"(无名)", (long)r,
+              trending ? @"（连续变强，预连）" : @"",
+              isMine ? @"UUID 命中" : @"名字命中");
         [self adopt:p why:(isMine ? @"UUID 命中" : @"名字命中")];
+        if (trending) {
+            SPLog(@"link", @"★ RSSI 连续 %ld 次变强（%ld → %ld）—— 提前发起连接",
+                  (long)_risingCount, (long)_rssiPrev, (long)r);
+            _connReqAt = 0;                       // ★ 1.3.0 的 3 秒节流：预连必须能真正下发
+        }
         [self forceReconnect:(isMine ? @"UUID 命中" : @"名字命中")];
     } @catch (NSException *e) { SPLog(@"link", @"didDiscover 异常: %@", e.reason); }
 }
@@ -1073,11 +1100,17 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
 }
 
 - (void)retryLater:(NSString *)why {
-    // ★ A3：原来这里是 static 局部变量 —— 只增不减、全工程无重置点，封顶后永远 30 秒。
-    //   改实例变量 _backoff，并在 didConnectPeripheral 里复位为 1.0。
-    NSTimeInterval d = MIN(_backoff, 4.0);       // ★ 1.2.6：封顶 30s → 4s
-    _backoff = MIN(_backoff * 2.0, 4.0);
-    SPLog(@"link", @"%@ → %.0f 秒后重试", why, d);
+    // ★ 1.3.1（A）：掉线后**立即重连**，不再 1→2→4 秒退避。
+    //   1.3.0 真机（360 分钟，车在 30 米内 RSSI 中位 -94）：
+    //     12 次连接在线共 1284 秒 / 21616 秒 = 可用率仅 5.9%；
+    //     链路寿命 2s / 6s / 16s / 24s / 31s / 37s / 92s / 123s / 207s / 278s / 466s。
+    //   退避在这条链路质量下是纯损失：断开本身就意味着「已经浪费了一段时间」，
+    //   再退避 1~4 秒只会把按键落空窗口进一步放大 —— 而按键帧只能靠已建链路承载
+    //   （真机 10:36:13 / 11:03:37 两次按键命中，都是刚好落在链路活着的窗口里）。
+    //   仍有 0.15 秒的极短延迟：避免 CoreBluetooth 在同一回调栈里被要求立刻重连。
+    NSTimeInterval d = 0.15;
+    _backoff = 1.0;                              // 保留字段语义，但不再用于延时
+    SPLog(@"link", @"%@ → %.2f 秒后立即重连", why, d);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                    SPQueue(), ^{                                   // ★ B1
         [self tryConnect];
