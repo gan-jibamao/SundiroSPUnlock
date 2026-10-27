@@ -28,7 +28,7 @@
 #include <sys/stat.h>
 #import <os/log.h>
 
-#define SPVER        @"1.3.2"
+#define SPVER        @"1.3.3"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -519,13 +519,27 @@ static NSDictionary *SPConnectOptions(void) {
 - (void)forceReconnect:(NSString *)why {
     if (!_cm || _cm.state != CBManagerStatePoweredOn) return;
     if (!_car || _car.state == CBPeripheralStateConnected) return;
-    // ★ 1.3.0：节流。AllowDuplicates 开着时车每秒会回调多次，原来每个广播包都
-    //   重新下发一次 connectPeripheral + 打两条日志（靠近时每秒数条，加速轮转）。
-    //   pending connect 挂着时重复下发无任何收益，3 秒内只下发一次。
+    // ★ 1.3.3（A）：车在广播 = 车醒着 = 这是最能连上的窗口，必须抢抓。
+    //   1.3.2 真机铁证：21:26:29 断开后，pending connect 挂了 26 分钟（21:47:21
+    //   已挂 1252 秒）都连不上，用户这期间按车钥匙按了很多下全部落空（零日志）。
+    //   而 21:53:05 车一广播（RSSI 突然 -46），1 秒内就连上，21:53:14 按键 1319 ms 完成。
+    //   也就是说：瓶颈不是「连不上」，是「车醒着的那几十秒里我们没把连接推上去」。
+    //   原来的 3 秒节流在弱信号下等于白白放走唤醒窗口 —— 车广播往往只持续很短时间。
+    //   改为：车在广播时（本函数只会由 didDiscoverPeripheral 命中后调用）
+    //   节流到 0.5 秒；其余路径不变。
     NSTimeInterval fnow = SPNow();
-    if (_connReqAt > 0 && fnow - _connReqAt < 3.0) return;
+    if (_connReqAt > 0 && fnow - _connReqAt < 0.5) return;
     _connReqAt = fnow;
-    SPLog(@"link", @"扫描命中 → 重新下发连接请求（%@，外设状态=%ld）", why, (long)_car.state);
+    // ★ 1.3.3（A）：车在广播时，强制推翻可能已「假挂起」的 pending connect。
+    //   1.3.2 真机铁证：21:26:29 断开后，pending connect 挂了 26 分钟（21:47:21
+    //   已挂 1252 秒，外设状态=1 Connecting），iOS 自认为还在连，实际上早已放弃。
+    //   这期间车广播了很多次（21:20 有 36 次「车出现」），我们每次调 connectPeripheral
+    //   都被系统忽略（因为 state==Connecting），直到 21:53:05 RSSI 突然 -46 才连上。
+    //   也就是说：状态=1 的 pending connect 可能是**僵尸**，cancel 再 connect 才是正解。
+    //   代价：每次 cancel+connect 之间有极短空窗，但比起「挂 26 分钟连不上」完全值得。
+    SPLog(@"link", @"扫描命中 → 强制重发连接（%@，外设状态=%ld，取消旧 pending）",
+          why, (long)_car.state);
+    [_cm cancelPeripheralConnection:_car];
     _connecting = YES;
     if (!_connAt) _connAt = fnow;               // 守卫哨兵锚点；不改写早先的请求时刻
     [_cm connectPeripheral:_car options:SPConnectOptions()];
