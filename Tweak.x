@@ -28,7 +28,7 @@
 #include <sys/stat.h>
 #import <os/log.h>
 
-#define SPVER        @"1.3.3"
+#define SPVER        @"1.3.4"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -967,7 +967,11 @@ static NSDictionary *SPConnectOptions(void) {
         // ★ 1.3.0：识别与日志保留，但 RSSI 不再作为连接门禁（连接提前备好，
         //   按键才有链路可承载）。1.2.15 曾在这里按 RSSI ≥ -80 拦截，已撤销。
         NSTimeInterval now = SPNow();
+        // ★ 1.3.4：RSSI 无效值过滤。CoreBluetooth 用 127 表示「本次广播没有有效 RSSI」，
+        //   1.3.3 真机 10-28 11:23:34 出现过 `RSSI=127`，会让趋势判定误判「信号暴涨」。
+        //   负值才是真实信号；0 与正数一律丢弃，只用上一次的有效值。
         NSInteger r = RSSI.integerValue;
+        BOOL rssiValid = (r < 0 && r > -127);
         // ★ 1.3.1（B）：RSSI 趋势预连。
         //   1.3.0 真机 360 分钟实证：链路可用率仅 5.9%，而两次命中按键
         //   （10:36:13 / 11:03:37）都是「刚好落在链路活着的窗口」。也就是说——
@@ -976,6 +980,17 @@ static NSDictionary *SPConnectOptions(void) {
         //   这里加一层：当 RSSI 连续 3 次变强（人正在走近），提前发起连接，
         //   争取让用户走到车旁时链路已经备好，按第一下就能中。
         //   节流 60 秒，避免同一波接近重复下发。
+        // ★ 1.3.4：无效 RSSI 直接跳过趋势计算（1.3.3 真机见过 RSSI=127 的哨兵值）
+        if (!rssiValid) {
+            if (now - _rssiLogAt > 30.0) {
+                _rssiLogAt = now;
+                SPLog(@"link", @"★ 车出现 %@（RSSI 无效=%@，忽略）— %@",
+                      nm ?: @"(无名)", RSSI, isMine ? @"UUID 命中" : @"名字命中");
+            }
+            [self adopt:p why:(isMine ? @"UUID 命中" : @"名字命中")];
+            [self forceReconnect:(isMine ? @"UUID 命中" : @"名字命中")];
+            return;
+        }
         if (_lastRSSI != 0 && r > _lastRSSI + 2) {
             _risingCount++;
         } else if (r <= _lastRSSI) {
@@ -986,7 +1001,9 @@ static NSDictionary *SPConnectOptions(void) {
         _lastSeenAt = now;
         BOOL trending = (_risingCount >= 3 && (now - _trendConnAt > 60.0));
         if (trending) _trendConnAt = now;
-        SPLog(@"link", @"★ 车出现 %@ RSSI=%ld%s — %@",
+        // ★ 1.3.4：原来是 %s + C 字符串，中文经 NSString 系统编码（MacRoman）解释后
+        //   变成乱码（1.3.3 真机表现为 `RSSI=-96¿÷à˜ c`）。改用 %@ + NSString 字面量。
+        SPLog(@"link", @"★ 车出现 %@ RSSI=%ld%@ — %@",
               nm ?: @"(无名)", (long)r,
               trending ? @"（连续变强，预连）" : @"",
               isMine ? @"UUID 命中" : @"名字命中");
