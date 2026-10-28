@@ -28,7 +28,7 @@
 #include <sys/stat.h>
 #import <os/log.h>
 
-#define SPVER        @"1.3.4"
+#define SPVER        @"1.3.5"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -530,16 +530,24 @@ static NSDictionary *SPConnectOptions(void) {
     NSTimeInterval fnow = SPNow();
     if (_connReqAt > 0 && fnow - _connReqAt < 0.5) return;
     _connReqAt = fnow;
-    // ★ 1.3.3（A）：车在广播时，强制推翻可能已「假挂起」的 pending connect。
-    //   1.3.2 真机铁证：21:26:29 断开后，pending connect 挂了 26 分钟（21:47:21
-    //   已挂 1252 秒，外设状态=1 Connecting），iOS 自认为还在连，实际上早已放弃。
-    //   这期间车广播了很多次（21:20 有 36 次「车出现」），我们每次调 connectPeripheral
-    //   都被系统忽略（因为 state==Connecting），直到 21:53:05 RSSI 突然 -46 才连上。
-    //   也就是说：状态=1 的 pending connect 可能是**僵尸**，cancel 再 connect 才是正解。
-    //   代价：每次 cancel+connect 之间有极短空窗，但比起「挂 26 分钟连不上」完全值得。
-    SPLog(@"link", @"扫描命中 → 强制重发连接（%@，外设状态=%ld，取消旧 pending）",
-          why, (long)_car.state);
-    [_cm cancelPeripheralConnection:_car];
+    // ★ 1.3.5：修 1.3.3 引入的死循环。1.3.3 在这里**无条件** cancelPeripheralConnection，
+    //   而车在广播时每秒会回调多次 ⇒ 每秒 cancel 一次 ⇒ 连接永远建立不起来。
+    //   真机铁证（10-28 19:35:51 起）：13 分钟里 188 次断开 / 184 次强制重发 /
+    //   只有 6 次连上，且「车主动发帧」= 0 —— 用户按键一次都没被识别，
+    //   因为链路从未真正建立过。
+    //   现在：只有「挂起超过 90 秒且状态仍是 Connecting」才认定为真僵尸，才 cancel；
+    //   其余情况只调 connectPeripheral（对已挂起的请求是幂等的，系统会忽略重复下发）。
+    NSTimeInterval held = (_connAt > 0) ? (fnow - _connAt) : 0;
+    BOOL zombie = (_car.state == CBPeripheralStateConnecting && held > 90.0);
+    if (zombie) {
+        SPLog(@"link", @"★ 僵尸 pending（已挂 %.0f 秒，状态=1）—— 取消后重发（%@）",
+              held, why);
+        _stuckCancel = YES;              // ★ 1.3.5：标记我方 cancel，断线回调里不再重复排程
+        [_cm cancelPeripheralConnection:_car];
+    } else {
+        SPLog(@"link", @"扫描命中 → 重发连接请求（%@，外设状态=%ld，已挂 %.0f 秒）",
+              why, (long)_car.state, held);
+    }
     _connecting = YES;
     if (!_connAt) _connAt = fnow;               // 守卫哨兵锚点；不改写早先的请求时刻
     [_cm connectPeripheral:_car options:SPConnectOptions()];
@@ -943,6 +951,26 @@ static NSDictionary *SPConnectOptions(void) {
         if (p.state == CBPeripheralStateConnected) return;
         BOOL isMine = (p.identifier.UUIDString && _carUUID.length &&
                        [_carUUID caseInsensitiveCompare:p.identifier.UUIDString] == NSOrderedSame);
+        // ★ 1.3.5：状态=Connecting 时不再反复触发连接下发。
+        //   1.3.3 真机（10-28 19:35:51 起 13 分钟）：车在广播时每秒回调多次，
+        //   每次都走 forceReconnect，配合无条件的 cancel ⇒ 188 次断开 / 184 次重发 /
+        //   仅 6 次连上，「车主动发帧」= 0（用户按键完全没被识别）。
+        //   正常挂起交给 forceReconnect 内部的「僵尸判定（>90 秒）」处理，
+        //   这里只负责把 RSSI 记下来，不再驱动连接。
+        if (p.state == CBPeripheralStateConnecting) {
+            NSInteger rr = RSSI.integerValue;
+            if (rr < 0 && rr > -127) {
+                _lastRSSI   = rr;
+                _lastSeenAt = SPNow();
+            }
+            // 唯一例外：真僵尸（挂起 >90 秒）—— 必须在这里主动调一次，
+            // 否则 forceReconnect 永远不会被触发，僵尸状态无法解除。
+            NSTimeInterval heldNow = (_connAt > 0) ? (SPNow() - _connAt) : 0;
+            if (heldNow > 90.0) {
+                [self forceReconnect:(isMine ? @"UUID 命中(僵尸)" : @"名字命中(僵尸)")];
+            }
+            return;
+        }
         // ② 名字前缀命中（车名实测 SDH-xxxxxx）
         // ★ 1.2.14：已知车名后必须**完全同名**才认。
         //   「SDH-」只是品牌前缀，不是唯一标识 —— 现场同时有两台 SDH- 车
