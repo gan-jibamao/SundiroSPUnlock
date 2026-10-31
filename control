@@ -1,6 +1,6 @@
 Package: com.jibamao.spsundiro
 Name: Sundiro BLE Unlock (SpringBoard)
-Version: 1.3.5
+Version: 1.3.9
 Architecture: iphoneos-arm64e
 Description: 新大洲本田蓝牙无感解锁，直接跑在 SpringBoard 内，不依赖官方 App。解锁协议完全离线（49 组配对 + 4 帧报文），不联网、不采集数据。安全阀：创建 /var/mobile/Library/Preferences/com.jibamao.spsundiro.off 后注销桌面即停用。
 Maintainer: jibamao

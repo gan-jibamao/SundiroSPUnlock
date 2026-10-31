@@ -28,7 +28,7 @@
 #include <sys/stat.h>
 #import <os/log.h>
 
-#define SPVER        @"1.3.5"
+#define SPVER        @"1.3.9"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -542,12 +542,38 @@ static NSDictionary *SPConnectOptions(void) {
     if (zombie) {
         SPLog(@"link", @"★ 僵尸 pending（已挂 %.0f 秒，状态=1）—— 取消后重发（%@）",
               held, why);
-        _stuckCancel = YES;              // ★ 1.3.5：标记我方 cancel，断线回调里不再重复排程
+        _stuckCancel = YES;              // 标记我方 cancel，断线回调里不再重复排程
+        // ★ A1 修复：cancel 之后必须把挂起锚点归零。
+        //   1.3.5 原实现不清 _connAt，于是下一帧广播（约 1 秒后）state 又是 1、
+        //   held 仍 > 90 ⇒ 再次判定僵尸 ⇒ 再次 cancel ⇒ 连接永远建不起来。
+        //   真机铁证（20:01:27–20:01:39，车 RSSI -86~-94 的黄金窗口，12 秒内 6 轮）：
+        //     已挂 92 秒 → 连接请求 / 已挂 93 秒 → 僵尸 cancel
+        //     已挂 99 秒 → 连接请求 / 已挂 99 秒 → 僵尸 cancel
+        //     已挂 100 秒 → 连接请求 / 已挂 100 秒 → 僵尸 cancel
+        //     已挂 101 秒 → 连接请求 / 已挂 102 秒 → 僵尸 cancel
+        //     已挂 104 秒 → 连接请求 / 已挂 104 秒 → 僵尸 cancel
+        //   全日志 86 次僵尸 pending，全部配一次「主动/正常断开」，一次没连成。
+        //   v1.3.7 实测：修复后僵尸 pending 88 次 → 0 次，连接 4/4 全部秒连成功。
+        _connAt    = fnow;               // ← 新增：重置锚点，下一帧广播不再误判僵尸
+        _connReqAt = 0;                  // ← 新增：清 0.5 秒节流
         [_cm cancelPeripheralConnection:_car];
-    } else {
-        SPLog(@"link", @"扫描命中 → 重发连接请求（%@，外设状态=%ld，已挂 %.0f 秒）",
-              why, (long)_car.state, held);
+        // ← 新增：cancel 后主动重下一次连接，不再依赖下一帧广播。
+        //   注意不能用 _round 做代际校验 —— didDisconnectPeripheral 里会 _round++，
+        //   cancel 触发的断线回调会把 genZ 立即作废，导致重连永远被 return 掉。
+        //   也不能在 state==Connecting 时 return —— cancel 后状态回落是异步的，
+        //   0.2 秒时很可能仍报 Connecting，那样等于「取消了却不再连」。
+        //   connectPeripheral 对已挂起的请求是幂等的（1.3.5 注释已确认）。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                       SPQueue(), ^{
+            if (!self->_cm || self->_cm.state != CBManagerStatePoweredOn) return;
+            if (!self->_car || self->_car.state == CBPeripheralStateConnected) return;
+            self->_connecting = YES;
+            [self->_cm connectPeripheral:self->_car options:SPConnectOptions()];
+        });
+        return;                          // ← 新增：不再往下走重复 connect
     }
+    SPLog(@"link", @"扫描命中 → 重发连接请求（%@，外设状态=%ld，已挂 %.0f 秒）",
+          why, (long)_car.state, held);
     _connecting = YES;
     if (!_connAt) _connAt = fnow;               // 守卫哨兵锚点；不改写早先的请求时刻
     [_cm connectPeripheral:_car options:SPConnectOptions()];
@@ -971,6 +997,21 @@ static NSDictionary *SPConnectOptions(void) {
             }
             return;
         }
+        // ★ A5 修复：状态=Disconnected 且看到车在广播 ⇒ 立刻重连，不等 SPTick 的 15 秒。
+        //   用户的解锁流程是「靠近 → 按车键 → 车只在那一刻推一帧」，
+        //   车不会重发；链路若正好断在这 15 秒空窗里，那一帧就永久丢失，
+        //   表现出来就是「按了没反应」。
+        //   现在：车醒着（在广播）就直接把连接推上去，1 秒节流防风暴。
+        if (isMine && p.state == CBPeripheralStateDisconnected) {
+            NSTimeInterval seenNow = SPNow();
+            if (seenNow - _connReqAt > 1.0) {
+                SPLog(@"link", @"★ 车在广播但链路断开 —— 立即重连（A5）");
+                _connReqAt = seenNow;
+                _connecting = YES;
+                _connAt = seenNow;       // 新请求，重新计时（避免被误判成 90 秒僵尸）
+                [_cm connectPeripheral:p options:SPConnectOptions()];
+            }
+        }
         // ② 名字前缀命中（车名实测 SDH-xxxxxx）
         // ★ 1.2.14：已知车名后必须**完全同名**才认。
         //   「SDH-」只是品牌前缀，不是唯一标识 —— 现场同时有两台 SDH- 车
@@ -1151,6 +1192,30 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
     if (_stuckCancel) {
         _stuckCancel = NO;
         SPLog(@"link", @"（主动取消后的断线回调 —— 重连已排程，不重复）");
+        // ★ A6 修复（秒解锁）：**必须保住扫描**，否则会永久失明。
+        //   1.3.8 真机铁证（10-30 21:45 → 10-31 12:54，10 小时）：
+        //     27 次断开里只有 5 次随后「开始扫描」，22 次僵尸取消后**一次都没扫**。
+        //   原因就是这个 return —— 它跳过了 retryLater，而 retryLater 才是
+        //   tryConnect → beginScan 的唯一入口。结果：取消之后既不扫描也不重连，
+        //   只能干等 SPTick 的 15 秒心跳拍，期间完全看不到车在不在广播。
+        //   而 A5（车在广播就立刻重连）的触发源正是扫描回调 —— 不扫描 ⇒ A5 永不触发。
+        //   真机佐证：10 小时里「车在广播但链路断开」= 0 次，A5 形同虚设。
+        //   实测代价：11:46:08 连上 → 11:46:58 超时断 → 11:48:18 才连上，
+        //   中间空了 80 秒；用户若早按 30 秒，那一帧就永远丢失（车不重发）。
+        //
+        //   两步都要做：
+        //   ① 立刻开始扫描 —— 车一广播，A5 就能在 1 秒内把连接推上去；
+        //   ② 0.3 秒后主动下发一次连接 —— 车若本来就在广播范围内，不等扫描回调直接连。
+        //      0.3 秒是为了让 CoreBluetooth 把 cancel 的状态机走完（参考 1.2.6 的抢连值）。
+        [self beginScan:@"僵尸取消后保活扫描（A6）"];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       SPQueue(), ^{
+            if (self->_cm.state != CBManagerStatePoweredOn) return;
+            if (!self->_car || self->_car.state == CBPeripheralStateConnected) return;
+            self->_connecting = YES;
+            self->_connAt = SPNow();     // 新请求重新计时，避免立刻又被判僵尸
+            [self->_cm connectPeripheral:self->_car options:SPConnectOptions()];
+        });
         return;
     }
     // ★ 1.2.6：GATT 未就绪就断 = 车刚醒 / 闪断（实测占全部链路的 20.8%）。
