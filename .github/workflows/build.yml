@@ -45,57 +45,6 @@ jobs:
           find packages -name '*.deb' -exec cp {} out/ \;
           ls -l out/
 
-      - name: Inspect section layout + signature
-        run: |
-          rm -rf ext && mkdir ext
-          deb=$(ls out/*.deb | head -1)
-          dpkg-deb -x "$deb" ext
-          dyl=$(find ext -name 'SundiroSPUnlock.dylib' | head -1)
-          python3 - "$dyl" <<'PYEOF'
-          import struct,sys
-          p=sys.argv[1]
-          d=open(p,'rb').read()
-          n=struct.unpack('>I',d[4:8])[0]
-          cpu,sub,base,size,al=struct.unpack('>IIIII',d[8:28])
-          sl=d[base:base+size]
-          ncmds=struct.unpack('<I',sl[16:20])[0]
-          p2=32; secs={}; sig=None; sdk=None
-          for _ in range(ncmds):
-              cmd,cs=struct.unpack('<II',sl[p2:p2+8])
-              if cmd==0x1d: sig=struct.unpack('<II',sl[p2+8:p2+16])
-              if cmd==0x32:
-                  plat,minos,sd=struct.unpack('<III',sl[p2+8:p2+20])
-                  f=lambda x:f"{(x>>16)&0xffff}.{(x>>8)&0xff}.{x&0xff}"
-                  sdk=f"minos={f(minos)} sdk={f(sd)}"
-              if cmd==0x19:
-                  segnm=sl[p2+8:p2+24].split(b'\0')[0].decode(errors='replace')
-                  ns=struct.unpack('<I',sl[p2+64:p2+68])[0]
-                  sp=p2+72; lst=[]
-                  for _ in range(ns):
-                      lst.append(sl[sp:sp+16].split(b'\0')[0].decode(errors='replace'))
-                      sp+=80
-                  secs[segnm]=lst
-              p2+=cs
-          print(f"   {sdk}")
-          print(f"   __TEXT({len(secs.get('__TEXT',[]))}): {secs.get('__TEXT',[])}")
-          print(f"   __DATA_CONST({len(secs.get('__DATA_CONST',[]))})")
-          so,ssz=sig
-          blob=sl[so:so+ssz]
-          cnt=struct.unpack('>I',blob[8:12])[0]
-          ht=alt=None; types=[]
-          p3=12
-          for i in range(cnt):
-              t,o2=struct.unpack('>II',blob[p3:p3+8]); types.append(hex(t))
-              cd=blob[o2:]
-              if t==0: ht=(cd[37],cd[36])
-              if t==0x1000: alt=(cd[37],cd[36])
-              p3+=8
-          print(f"   blobs={cnt} types={types}")
-          print(f"   primary={ht}  alt={alt}")
-          need = ('__objc_stubs' in secs.get('__TEXT',[]))
-          print(f"   {'✅ 含 __objc_stubs' if need else '❌ 缺 __objc_stubs（与 1.3.9 不符）'}")
-          PYEOF
-
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
