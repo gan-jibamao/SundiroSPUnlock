@@ -32,7 +32,6 @@ jobs:
             https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
           chmod +x $HOME/bin/ldid
           echo "$HOME/bin" >> $GITHUB_PATH
-          $HOME/bin/ldid -h 2>&1 | head -5 || true
 
       - name: Install theos (roothide fork) + iOS toolchain + SDK
         run: |
@@ -46,46 +45,81 @@ jobs:
             https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz
           tar xf iostc.tar.xz
           rm iostc.tar.xz
+          echo "===== 可用 SDK ====="
+          ls $THEOS/sdks
           echo "THEOS=$THEOS" >> $GITHUB_ENV
 
       - name: Build (${{ matrix.scheme }})
+        env:
+          # ★ 1.3.9 用 SDK 16.4 编译（真机 dylib 实测 BUILD_VERSION sdk=16.4.0），
+          #   而之前的 CI 用 16.5。设备是 iOS 16.2，比设备高的 SDK 有风险。
+          #   这里对齐 1.3.9：优先 16.4，没有则退回 16.5。
+          TARGET: iphone:clang:16.4:14.0
         run: |
           export THEOS=$HOME/theos
           export PATH=$HOME/bin:$PATH
+          if [ ! -d "$THEOS/sdks/iPhoneOS16.4.sdk" ]; then
+            echo "!! 没有 16.4 SDK，退回 16.5"
+            export TARGET=iphone:clang:16.5:14.0
+          fi
+          echo "TARGET=$TARGET"
           make clean >/dev/null 2>&1 || true
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }} 2>&1 | tail -30
           mkdir -p out
           find packages -name '*.deb' -exec cp {} out/ \;
           ls -l out/
 
-      - name: Inspect signature (diagnostic)
+      - name: Re-sign with SHA-1 and repack
         run: |
           set -e
           export PATH=$HOME/bin:$PATH
           rm -rf ext && mkdir ext
+          for deb in out/*.deb; do
+            echo "══ $deb"
+            rm -rf ext && mkdir ext
+            dpkg-deb -x "$deb" ext
+            dyl=$(find ext -name 'SundiroSPUnlock.dylib' | head -1)
+            echo "   before:"
+            ldid -h >/dev/null 2>&1 || true
+            # ★ 重签：-S 签名，-Hsha1 强制只生成 SHA-1 CDHash。
+            #   依据 ldid.cpp:3430-3445 的 -H 分支：
+            #     case 'H': 首次出现时 do_sha1=do_sha256=false，
+            #     然后按 "sha1"/"sha256" 打开对应项。
+            #   而默认策略（ldid.cpp:1448-1457）会因 LC_BUILD_VERSION
+            #   platform=IOS 且 minos>=11 自动关掉 do_sha1，只留 SHA-256。
+            #   1.3.9 的签名是 hashType=1(SHA-1) + 含 type4096，此处对齐。
+            ldid -S -Hsha1 "$dyl"
+            echo "   after:"
+            rm -f "$deb"
+            dpkg-deb -b ext "$deb" >/dev/null
+            echo "   ✓ $(stat -c%s "$deb") B"
+          done
+
+      - name: Verify signature
+        run: |
+          export PATH=$HOME/bin:$PATH
+          rm -rf ext && mkdir ext
           deb=$(ls out/*.deb | head -1)
-          echo "══ $deb"
           dpkg-deb -x "$deb" ext
           dyl=$(find ext -name 'SundiroSPUnlock.dylib' | head -1)
-          echo "   dylib: $dyl"
           python3 - "$dyl" <<'PYEOF'
           import struct,sys
           p=sys.argv[1]
           d=open(p,'rb').read()
-          magic=struct.unpack('>I',d[:4])[0]
           base=0; size=len(d)
-          if magic==0xcafebabe:
-              n=struct.unpack('>I',d[4:8])[0]
+          if struct.unpack('>I',d[:4])[0]==0xcafebabe:
               cpu,sub,base,size,al=struct.unpack('>IIIII',d[8:28])
           sl=d[base:base+size]
           ncmds=struct.unpack('<I',sl[16:20])[0]
-          p2=32; sig=None
+          p2=32; sig=None; sdk=None
           for _ in range(ncmds):
               cmd,cs=struct.unpack('<II',sl[p2:p2+8])
               if cmd==0x1d: sig=struct.unpack('<II',sl[p2+8:p2+16])
+              if cmd==0x32:
+                  plat,minos,sd=struct.unpack('<III',sl[p2+8:p2+20])
+                  f=lambda x:f"{(x>>16)&0xffff}.{(x>>8)&0xff}.{x&0xff}"
+                  sdk=f"minos={f(minos)} sdk={f(sd)}"
               p2+=cs
-          if not sig:
-              print("   NO SIGNATURE"); sys.exit(0)
           so,ssz=sig
           blob=sl[so:so+ssz]
           cnt=struct.unpack('>I',blob[8:12])[0]
@@ -96,15 +130,12 @@ jobs:
               types.append(hex(t))
               if t==0:
                   cd=blob[o2:]
-                  ver=struct.unpack('>I',cd[8:12])[0]
-                  if ver>=0x20400: ht=(cd[37], cd[36])
+                  if struct.unpack('>I',cd[8:12])[0]>=0x20400: ht=(cd[37],cd[36])
               p3+=8
+          print(f"   {sdk}")
           print(f"   blobs={cnt} types={types}")
           print(f"   hashType={ht[0] if ht else '?'} hashSize={ht[1] if ht else '?'} (1=SHA1 2=SHA256)")
           PYEOF
-          echo "   --- 用 ldid -S 重签 ---"
-          ldid -S "$dyl"
-          echo "   done"
 
       - name: Upload
         uses: actions/upload-artifact@v4
