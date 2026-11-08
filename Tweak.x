@@ -26,6 +26,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 #import <os/log.h>
 
 #define SPVER        @"1.3.9"
@@ -506,7 +507,13 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
 // ★ 1.2.13：连接选项。iOS 17+ 带「允许系统自动重连」，让 bluetoothd 替我们守着回连；
 //   官方 App 同样做法（SundiroBLE.m:583-586）。iOS 16 上不传，避免未知 key 引发异常。
 static NSDictionary *SPConnectOptions(void) {
-    if (@available(iOS 17.0, *)) return @{ @"kCBConnectOptionEnableAutoReconnect": @YES };
+    static BOOL probed = NO;
+    static BOOL supported = NO;
+    if (!probed) {
+        probed = YES;
+        supported = (dlsym(RTLD_DEFAULT, "kCBConnectOptionEnableAutoReconnect") != NULL);
+    }
+    if (supported) return @{ @"kCBConnectOptionEnableAutoReconnect": @YES };
     return nil;
 }
 
