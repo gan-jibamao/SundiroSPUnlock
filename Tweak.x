@@ -26,6 +26,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 #import <os/log.h>
 
 #define SPVER        @"1.3.10"
@@ -506,7 +507,25 @@ static void SPTick(SPUnlocker *u);   // ★ D2：start 里要启动常驻驱动�
 // ★ 1.2.13：连接选项。iOS 17+ 带「允许系统自动重连」，让 bluetoothd 替我们守着回连；
 //   官方 App 同样做法（SundiroBLE.m:583-586）。iOS 16 上不传，避免未知 key 引发异常。
 static NSDictionary *SPConnectOptions(void) {
-    if (@available(iOS 17.0, *)) return @{ @"kCBConnectOptionEnableAutoReconnect": @YES };
+    // ★ 1.3.10-CI：改用「运行期 API 存在性探测」代替 @available。
+    //   原因：@available 会引用编译期符号 ___isPlatformVersionAtLeast，
+    //   该符号由 libclang_rt.iossim/系统库提供；在 Linux 上用 theos 的
+    //   iOSToolchain 交叉编译时链接不到它，arm64 与 arm64e 双架构全部报
+    //   `Undefined symbols: ___isPlatformVersionAtLeast`，
+    //   构建在 Linking 阶段失败（2026-11-08 CI #63 实测）。
+    //   改用 dlsym 探测 CoreBluetooth 里该常量的符号是否存在：
+    //   · iOS 17+ 有该常量 ⇒ 返回字典，语义与原来完全一致
+    //   · iOS 16 及以下没有 ⇒ 返回 nil，与原 @available 分支一致
+    //   注意：只在首次调用时探测一次，结果缓存，不落在解锁关键路径上。
+    static BOOL probed = NO;
+    static BOOL supported = NO;
+    if (!probed) {
+        probed = YES;
+        // kCBConnectOptionEnableAutoReconnect 是 CoreBluetooth 导出的 NSString * 常量
+        void *sym = dlsym(RTLD_DEFAULT, "kCBConnectOptionEnableAutoReconnect");
+        supported = (sym != NULL);
+    }
+    if (supported) return @{ @"kCBConnectOptionEnableAutoReconnect": @YES };
     return nil;
 }
 
