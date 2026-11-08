@@ -2,12 +2,15 @@ name: Build SundiroSPUnlock
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, fix/seconds-unlock ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    # ★ 2026-11-08：macos-14 分配不到 runner（runner_id=0 / runner_name 空，
+    #   1 秒内 cancelled），与 10-31 能跑成功的同一份 workflow 形成对照。
+    #   迁到 ubuntu-latest 绕开，Linux 侧需自备 theos 的 iOS 工具链 + ldid。
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -16,20 +19,51 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install theos (roothide fork) + SDK + ldid
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential fakeroot rsync curl perl git zip xz-utils \
+            libxml2-dev dpkg-dev clang llvm libtinfo5 libncurses5 2>/dev/null || \
+          sudo apt-get install -y -qq \
+            build-essential fakeroot rsync curl perl git zip xz-utils \
+            libxml2-dev dpkg-dev clang llvm
+          # fakeroot 需切 sysv 后端（theos 打包要求）
+          sudo update-alternatives --set fakeroot /usr/bin/fakeroot-sysv || true
+
+      - name: Install ldid
+        run: |
+          mkdir -p $HOME/bin
+          curl -fsSL -o /tmp/ldid \
+            https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+          chmod +x /tmp/ldid
+          mv /tmp/ldid $HOME/bin/ldid
+          echo "$HOME/bin" >> $GITHUB_PATH
+          ldid -h 2>&1 | head -3 || true
+
+      - name: Install theos (roothide fork) + iOS toolchain + SDK
         run: |
           export THEOS=$HOME/theos
           git clone --recursive --depth 1 https://github.com/roothide/theos.git $THEOS
           rm -rf $THEOS/sdks
           git clone --depth 1 https://github.com/theos/sdks.git $THEOS/sdks
-          brew install ldid
+          # Linux 需要额外装 iOS 工具链（macOS 由 Xcode 自带）
+          # 真实资产名：iOSToolchain-x86_64.tar.xz（不是带版本号的长名，实测 404）
+          mkdir -p $THEOS/toolchain
+          cd $THEOS/toolchain
+          curl -fsSL -o iostc.tar.xz \
+            https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz
+          tar xf iostc.tar.xz
+          rm iostc.tar.xz
+          ls -la
           echo "THEOS=$THEOS" >> $GITHUB_ENV
 
       - name: Build (${{ matrix.scheme }})
         run: |
           export THEOS=$HOME/theos
+          export PATH=$HOME/bin:$PATH
           make clean >/dev/null 2>&1 || true
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }}
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }} 2>&1 | tail -40
           mkdir -p out
           find packages -name '*.deb' -exec cp {} out/ \;
           ls -l out/
