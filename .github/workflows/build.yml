@@ -30,9 +30,10 @@ jobs:
           git clone --depth 1 https://github.com/theos/sdks.git $THEOS/sdks
           # ★ 还原 1.3.9 的 CI：macOS 上必须装 ldid（theos 签名步骤依赖它）
           brew install ldid
-          echo "===== Xcode 版本 ====="
+          echo "===== 切换 Xcode 16.0（对齐 1.3.9 的构建环境）====="
+          sudo xcode-select -s /Applications/Xcode_16.0.app 2>/dev/null || \
+            sudo xcode-select -s /Applications/Xcode_16.0.0.app
           xcodebuild -version || true
-          ls /Applications | grep -i xcode || true
           echo "===== clang ====="
           clang --version | head -2
           echo "===== 可用 SDK ====="
