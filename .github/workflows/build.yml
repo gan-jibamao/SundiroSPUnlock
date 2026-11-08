@@ -13,7 +13,7 @@ jobs:
     #   对照实验：纯 1.3.9 逻辑走 Linux CI，段结构与 1.3.10 完全一致（都缺
     #   __objc_stubs / __eh_frame / __objc_arraydata），证明与业务改动无关。
     #   只有 Apple 官方 clang + Xcode SDK 能保证产出可用 dylib。
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
