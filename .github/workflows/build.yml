@@ -77,10 +77,11 @@ jobs:
           for deb in out/*.deb; do
             echo "══ $deb"
             rm -rf ext && mkdir ext
-            dpkg-deb -x "$deb" ext
+            # ★ 必须用 -R（raw 解包）：-x 只解数据部分，不含 DEBIAN/，
+            #   之后 dpkg-deb -b 会因缺 DEBIAN/control 失败（CI #67 实测）。
+            dpkg-deb -R "$deb" ext
             dyl=$(find ext -name 'SundiroSPUnlock.dylib' | head -1)
-            echo "   before:"
-            ldid -h >/dev/null 2>&1 || true
+            echo "   dylib: $dyl"
             # ★ 重签：-S 签名，-Hsha1 强制只生成 SHA-1 CDHash。
             #   依据 ldid.cpp:3430-3445 的 -H 分支：
             #     case 'H': 首次出现时 do_sha1=do_sha256=false，
