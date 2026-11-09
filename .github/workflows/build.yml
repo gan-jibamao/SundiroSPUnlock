@@ -2,12 +2,18 @@ name: Build SundiroSPUnlock
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, fix/seconds-unlock, control-build ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    # ★ 2026-11-08：回到 macOS runner。
+    #   Linux(iOSToolchain+SDK16.5) 产出的 dylib 在 iOS 16.2 ellekit 里
+    #   dlopen 时崩在 objc readClass（地址 0xdac11a30，两次字节级相同）。
+    #   对照实验：纯 1.3.9 逻辑走 Linux CI，段结构与 1.3.10 完全一致（都缺
+    #   __objc_stubs / __eh_frame / __objc_arraydata），证明与业务改动无关。
+    #   只有 Apple 官方 clang + Xcode SDK 能保证产出可用 dylib。
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -16,20 +22,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install theos (roothide fork) + SDK + ldid
+      - name: Install theos (roothide fork) + SDK
         run: |
           export THEOS=$HOME/theos
           git clone --recursive --depth 1 https://github.com/roothide/theos.git $THEOS
           rm -rf $THEOS/sdks
           git clone --depth 1 https://github.com/theos/sdks.git $THEOS/sdks
+          # ★ 还原 1.3.9 的 CI：macOS 上必须装 ldid（theos 签名步骤依赖它）
           brew install ldid
+          echo "===== 切换 Xcode 16.0（对齐 1.3.9 的构建环境）====="
+          sudo xcode-select -s /Applications/Xcode_16.0.app 2>/dev/null || \
+            sudo xcode-select -s /Applications/Xcode_16.0.0.app
+          xcodebuild -version || true
+          echo "===== clang ====="
+          clang --version | head -2
+          echo "===== 可用 SDK ====="
+          ls $THEOS/sdks | grep iPhoneOS || true
+          echo "===== clang 版本 ====="
+          clang --version | head -3
           echo "THEOS=$THEOS" >> $GITHUB_ENV
 
       - name: Build (${{ matrix.scheme }})
         run: |
           export THEOS=$HOME/theos
           make clean >/dev/null 2>&1 || true
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }}
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }} 2>&1 | tail -30
           mkdir -p out
           find packages -name '*.deb' -exec cp {} out/ \;
           ls -l out/
@@ -37,6 +54,6 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: SundiroSPUnlock-${{ matrix.scheme }}
+          name: SundiroSPUnlock-mac-${{ matrix.scheme }}
           path: out/*.deb
           if-no-files-found: error
