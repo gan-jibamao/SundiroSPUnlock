@@ -29,7 +29,7 @@
 #include <dlfcn.h>
 #import <os/log.h>
 
-#define SPVER        @"1.3.10"
+#define SPVER        @"1.3.11"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -717,8 +717,13 @@ static NSDictionary *SPConnectOptions(void) {
             // 车不可见：不取消，只在日志里点明「在等车醒」，10 分钟一条别刷屏
             if (gnow - _guardLogAt > 600.0) {
                 _guardLogAt = gnow;
-                SPLog(@"link", @"连接挂起 %.0f 秒（状态=%ld）—— 车已 %.0f 秒不可见，继续等车广播",
-                      held, (long)_car.state, sinceSeen);
+                // ★ 1.3.11：_lastSeenAt==0 时 sinceSeen 是 1e9 哨兵，只服务上面「<=120」的判据，
+                //   不能原样拼进日志 —— 1.3.10 真机刷过 93 条「车已 1000000000 秒不可见」。
+                NSString *seenText = (_lastSeenAt > 0)
+                    ? [NSString stringWithFormat:@"车已 %.0f 秒不可见", sinceSeen]
+                    : @"本次会话从未见过车";
+                SPLog(@"link", @"连接挂起 %.0f 秒（状态=%ld）—— %@，继续等车广播",
+                      held, (long)_car.state, seenText);
             }
             return;
         }
@@ -1381,7 +1386,10 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
     //   未知帧型仍走时间闸门兜底，不丢新车型。
     {
         NSTimeInterval cnow = SPNow();
-        NSTimeInterval gap = (_lastCarAt > 0) ? (cnow - _lastCarAt) : 1e9;
+        // ★ 1.3.11：同一个 1e9 哨兵又被拼进日志了（「空闲 1000000000.0 秒」7 条）。
+        //   判据照旧用 gap，展示走 gapKnown。
+        BOOL gapKnown = (_lastCarAt > 0);
+        NSTimeInterval gap = gapKnown ? (cnow - _lastCarAt) : 1e9;
         _lastCarAt = cnow;
         if (_step == 0 && ch.value.length == 26) {
             const uint8_t *b = (const uint8_t *)ch.value.bytes;
@@ -1396,14 +1404,25 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
                 //   其中 %s 按**系统编码**解释（iOS 上是 MacRoman），而字面量是 UTF-8，
                 //   结果双重编码成「Áñë‰ººËΩ¶Áä∂ÊÄÅÂèòÊõ¥」（真机日志实证）。
                 //   改用 %@ + NSString 字面量，彻底绕开编码问题。
-                SPLog(@"direct", @"状态帧 —— 忽略（距上次解锁 %.1f 秒，空闲 %.1f 秒，%@）",
-                      sinceDone, gap,
+                // ★ 1.3.11：sinceDone 的 -1.0 与 gap 的 1e9 都是哨兵，不能原样进日志。
+                //   1.3.10 真机出现过「距上次解锁 -1.0 秒，空闲 1000000000.0 秒」。
+                NSString *doneText = (_doneAt > 0)
+                    ? [NSString stringWithFormat:@"距上次解锁 %.1f 秒", sinceDone]
+                    : @"此前从未解锁过";
+                NSString *statusGapText = gapKnown
+                    ? [NSString stringWithFormat:@"空闲 %.1f 秒", gap]
+                    : @"本次会话首帧";
+                SPLog(@"direct", @"状态帧 —— 忽略（%@，%@，%@）",
+                      doneText, statusGapText,
                       (sinceDone < 0 || sinceDone > 60.0) ? @"疑似车状态变更" : @"解锁回执");
                 return;                 // 永不当按键
             }
             if (isPress || gap > 4.0) {
-                SPLog(@"direct", @"★ 车主动发帧（%@，空闲 %.1f 秒）—— 判定为开关按下，立即发帧",
-                      isPress ? @"字节直认" : @"时间闸门", gap);
+                NSString *pressGapText = gapKnown
+                    ? [NSString stringWithFormat:@"空闲 %.1f 秒", gap]
+                    : @"本次会话首帧";
+                SPLog(@"direct", @"★ 车主动发帧（%@，%@）—— 判定为开关按下，立即发帧",
+                      isPress ? @"字节直认" : @"时间闸门", pressGapText);
                 _redoOnLink = 0;        // ★ 1.2.8：真实按键 → 兜底额度复位
                 _carSendsPress = YES;    // ★ 1.2.10：全局记忆 —— 重连不重置，本车永久关闭定时兜底
                 if (!isPress) {
