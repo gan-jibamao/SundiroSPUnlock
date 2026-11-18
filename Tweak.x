@@ -29,7 +29,7 @@
 #include <dlfcn.h>
 #import <os/log.h>
 
-#define SPVER        @"1.3.11"
+#define SPVER        @"1.3.12"
 #define kKillSwitch  @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.off"
 #define kLogPathConf @"/var/mobile/Library/Preferences/com.jibamao.spsundiro.logpath"
 #define kLogDefault  "/var/mobile/Library/Logs/sundirosp.log"
@@ -1301,12 +1301,13 @@ didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
     //   退避在这条链路质量下是纯损失：断开本身就意味着「已经浪费了一段时间」，
     //   再退避 1~4 秒只会把按键落空窗口进一步放大 —— 而按键帧只能靠已建链路承载
     //   （真机 10:36:13 / 11:03:37 两次按键命中，都是刚好落在链路活着的窗口里）。
-    //   仍有 0.15 秒的极短延迟：避免 CoreBluetooth 在同一回调栈里被要求立刻重连。
-    NSTimeInterval d = 0.15;
+    //   ★ 1.3.12（A1）：去掉 0.15 秒定时器，改 dispatch_async。
+    //   这个延时唯一的目的是「别在 CoreBluetooth 的断开回调栈里直接发起连接」，
+    //   下一轮 runloop 就够，不必白等一个定时器。
+    //   真机账（11-18，16.2 小时 / 393 次断开）：断开→连上中位 12.0 秒，0.15 占 0.9%。
     _backoff = 1.0;                              // 保留字段语义，但不再用于延时
-    SPLog(@"link", @"%@ → %.2f 秒后立即重连", why, d);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
-                   SPQueue(), ^{                                   // ★ B1
+    SPLog(@"link", @"%@ → 立即重连（异步）", why);
+    dispatch_async(SPQueue(), ^{                                    // ★ B1
         [self tryConnect];
     });
 }
